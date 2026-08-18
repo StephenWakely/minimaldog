@@ -58,6 +58,24 @@ section .bss
     parsed_port: resb 16
     parsed_path: resb 512
 
+; --- Runtime state for connection setup (TODO 2.1) -------------------------
+; Everything needed after parsing lives in named storage here; no later step
+; reparses the original URL.
+    envp_start: resq 1        ; pointer to the envp array, saved at _start
+    socket_fd: resd 4         ; open socket fd, 0 = no socket open
+    sockaddr_buf: resb 110    ; holds either sockaddr_un (110) or
+                              ; sockaddr_in / sockaddr_in6 (16 / 28)
+    socklen: resw 2           ; length of the address in sockaddr_buf
+    interval_secs: resd 4     ; metric and retry interval, default 60 (TODO 1.3)
+    parse_only: resb 1        ; DD_DOGSTATSD_PARSE_ONLY set -> print OK, exit 0
+; --- Canonical parse results handed to address construction (TODO 2.2/2.3) --
+; The host stays textual until connect time; the ipv6 flag and the binary
+; port are the only precomputed pieces. parsed_path is the single source of
+; truth for Unix transports and is length-checked against SUN_PATH_MAX when
+; the sockaddr_un is built (TODO 2.3).
+    parsed_ipv6: resb 1       ; 1 if the URL host was bracketed (IPv6 form)
+    parsed_port_bin: resw 2   ; UDP port in network byte order
+
 section .text
     global _start
 
@@ -110,45 +128,12 @@ _start:
     lea rsi, [rsp+8]      ; rsi = argv start
     lea rsi, [rsi+rcx*8+8] ; rsi = argv + argc + 1 (skip NULL terminator)
                             ; now rsi points to envp array
-find_env_var:
-    mov rdi, [rsi]        ; rdi = current env string pointer
-    test rdi, rdi
+    mov [envp_start], rsi
+    mov rdi, env_var_name
+    call find_env
+    test rax, rax
     jz start_not_found
-    mov rax, rdi
-    mov rdx, env_var_name
-    xor rbx, rbx          ; rbx = offset in string
-find_env_match:
-    mov r8b, [rax+rbx]
-    mov r9b, [rdx+rbx]
-    test r9b, r9b         ; if target char is null terminator
-    jz check_equals       ; potential match, check for '='
-    cmp r8b, r9b
-    jne next_env_var
-    inc rbx
-    jmp find_env_match
-check_equals:
-    mov r8b, [rax+rbx]    ; get char after env_var_name
-    cmp r8b, '='
-    jne next_env_var
-    jmp found_env_var
-next_env_var:
-    add rsi, 8
-    jmp find_env_var
-found_env_var:
-    ; rdi points to "VAR=value", find the '='
-    mov rax, rdi
-    mov rbx, 0
-find_equals:
-    mov cl, [rax+rbx]
-    test cl, cl
-    jz start_not_found    ; no '=' found, shouldn't happen
-    cmp cl, '='
-    je value_found
-    inc rbx
-    jmp find_equals
-value_found:
-    lea rdi, [rax+rbx+1]  ; rdi = pointer to value part
-    mov rsi, rdi
+    mov rsi, rax          ; rsi = value string after '='
     mov rdi, url_buf
     mov rcx, 1024
     call copy_string
@@ -194,6 +179,43 @@ start_exit_error:
     mov rax, SYS_exit
     mov rdi, 1
     syscall
+
+; find_env(rdi = NUL-terminated name) -> rax = pointer to the value after
+; '=', or 0 if the variable is not present. Exact match: the name must be
+; followed by '='. Clobbers r8, r9, r10; saves rsi/rdx.
+find_env:
+    push rsi
+    push rdx
+    mov rsi, [envp_start]
+find_env_scan:
+    mov r10, [rsi]        ; current env string pointer
+    test r10, r10
+    jz find_env_not_found
+    lea r9, [r10]         ; r9 walks the env string
+    lea r8, [rdi]         ; r8 walks the name
+find_env_match:
+    movzx rax, byte [r8]
+    test al, al           ; end of name?
+    jz find_env_check_eq
+    cmp al, [r9]
+    jne find_env_next
+    inc r8
+    inc r9
+    jmp find_env_match
+find_env_check_eq:
+    cmp byte [r9], '='
+    jne find_env_next
+    lea rax, [r9+1]       ; value starts after '='
+    jmp find_env_done
+find_env_next:
+    add rsi, 8
+    jmp find_env_scan
+find_env_not_found:
+    xor rax, rax
+find_env_done:
+    pop rdx
+    pop rsi
+    ret
 
 copy_string:
     push rsi
@@ -285,8 +307,10 @@ parse_udp_check_special:
     inc rsi
     jmp parse_udp_check_special
 parse_udp_check_host:
+    xor byte [parsed_ipv6], 0   ; TODO 2.2: bracketed host => IPv6 form
     cmp byte [r12], '['
     jne parse_udp_ipv4_host
+    mov byte [parsed_ipv6], 1
     mov rsi, r12
 parse_udp_inc_search:
     mov al, [rsi]
@@ -522,6 +546,11 @@ parse_port_chk:
     ja parse_port_inv
     cmp rax, 0
     jz parse_port_inv
+    ; TODO 2.2: cache the port in network byte order so address construction
+    ; does not reparse the textual port.
+    movzx eax, ax
+    xchg al, ah
+    mov [parsed_port_bin], ax
     mov rax, 1
 parse_port_done:
     pop rdx

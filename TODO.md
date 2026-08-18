@@ -57,6 +57,10 @@ Success criteria:
 
 ## 2. Extend Parsed State For Connection Setup
 
+Status: done — runtime state lives in named BSS (`socket_fd`,
+`sockaddr_buf`, `socklen`, `interval_secs`, `envp_start`, ...); the envp
+scan is factored into `find_env`.
+
 ### 2.1 Add storage for socket and transport state
 - Add BSS or data slots for:
   socket fd, reconnect-needed flag, metric buffer, metric length, and any
@@ -69,6 +73,11 @@ Success criteria:
 - No stage needs to recompute values by reparsing the original URL.
 
 ### 2.2 Preserve parsed UDP host and port in canonical form
+
+Status: done — the host stays textual until connect time; `parsed_ipv6`
+(bracketed-host flag) and `parsed_port_bin` (network byte order, filled at
+parse time) are the precomputed handoff to address construction.
+
 - Confirm `parsed_host` and `parsed_port` are the only source of truth for UDP.
 - Decide whether the host remains textual until connect time or should be
   converted and cached earlier.
@@ -80,6 +89,11 @@ Success criteria:
 - No later step depends on output-format buffers by accident.
 
 ### 2.3 Preserve parsed Unix path in canonical form
+
+Status: done — `parsed_path` is the single input to sockaddr_un
+construction; length is validated against SUN_PATH_MAX (108) when the
+address buffer is built.
+
 - Confirm `parsed_path` is the only source of truth for Unix transports.
 - Record whether the path should be copied directly into `sockaddr_un` or first
   validated for maximum length.
