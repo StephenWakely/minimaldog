@@ -32,6 +32,7 @@
             pkgs.binutils
             pkgs.python3
             pkgs.python3Packages.pytest
+            pkgs.gdb
           ];
         };
 

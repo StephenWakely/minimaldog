@@ -75,17 +75,17 @@ find_env_var:
     mov rdx, env_var_name
     xor rbx, rbx          ; rbx = offset in string
 find_env_match:
-    mov cl, [rax+rbx]
-    mov dl, [rdx+rbx]
-    test dl, dl           ; if target char is null terminator
+    mov r8b, [rax+rbx]
+    mov r9b, [rdx+rbx]
+    test r9b, r9b         ; if target char is null terminator
     jz check_equals       ; potential match, check for '='
-    cmp cl, dl
+    cmp r8b, r9b
     jne next_env_var
     inc rbx
     jmp find_env_match
 check_equals:
-    mov dl, [rax+rbx]     ; get char after env_var_name
-    cmp dl, '='
+    mov r8b, [rax+rbx]    ; get char after env_var_name
+    cmp r8b, '='
     jne next_env_var
     jmp found_env_var
 next_env_var:
@@ -109,9 +109,9 @@ value_found:
     mov rdi, url_buf
     mov rcx, 1024
     call copy_string
-    mov rdi, rax
-    test byte [rdi], 0
+    cmp byte [url_buf], 0
     jz start_empty_url
+    mov rdi, url_buf
     call parse_url
     test rax, rax
     jnz start_parse_error
@@ -132,6 +132,7 @@ start_empty_url:
     jmp start_exit_error
 
 start_parse_error:
+    dec rax
     mov rdi, [parse_error_msgs + rax*8]
     call output_error
     jmp start_exit_error
@@ -197,22 +198,25 @@ parse_url:
     call strncmp
     test rax, rax
     jz parse_url_found_unixstream
-    mov rax, 1
+    mov r13, 1
     jmp parse_url_done
 parse_url_found_udp:
     mov byte [parsed_transport], 1
     add r12, 6
     call parse_udp
+    mov r13, rax
     jmp parse_url_done
 parse_url_found_unix:
     mov byte [parsed_transport], 2
     add r12, 7
     call parse_unix
+    mov r13, rax
     jmp parse_url_done
 parse_url_found_unixstream:
     mov byte [parsed_transport], 3
-    add r12, 11
+    add r12, 13
     call parse_unix
+    mov r13, rax
     jmp parse_url_done
 parse_url_done:
     mov rax, r13
@@ -222,18 +226,32 @@ parse_url_done:
     ret
 parse_udp:
     push r12
-    push r13
     push r14
-    mov r13, r12
     mov r14, r12
+    mov rsi, r12
+parse_udp_check_special:
+    mov al, [rsi]
+    cmp al, 0
+    je parse_udp_check_host
+    cmp al, '@'
+    je parse_udp_err_userinfo
+    cmp al, '?'
+    je parse_udp_err_query
+    cmp al, '#'
+    je parse_udp_err_fragment
+    inc rsi
+    jmp parse_udp_check_special
+parse_udp_check_host:
     cmp byte [r12], '['
     jne parse_udp_ipv4_host
+    mov rsi, r12
 parse_udp_inc_search:
-    lodsb
+    mov al, [rsi]
     cmp al, ']'
     je parse_udp_found_bracket
     cmp al, 0
     je parse_udp_err_nohost
+    inc rsi
     jmp parse_udp_inc_search
 parse_udp_found_bracket:
     mov rsi, r14
@@ -253,11 +271,13 @@ parse_udp_copy_ipv6:
 parse_udp_ipv6_copied:
     xor al, al
     stosb
+    cmp byte [parsed_host], 0
+    je parse_udp_err_nohost
     mov r12, rsi
     inc r12
     jmp parse_udp_check_colon
 parse_udp_err_nohost:
-    mov r13, 2
+    mov rax, 2
     jmp parse_udp_done
 parse_udp_ipv4_host:
     mov rsi, r12
@@ -278,18 +298,19 @@ parse_udp_copy_host:
 parse_udp_host_copied:
     xor al, al
     stosb
-    test rdi, rdi
+    cmp byte [parsed_host], 0
     jz parse_udp_err_nohost
     mov r12, rsi
+    jmp parse_udp_check_colon
 parse_udp_noport:
-    mov r13, 3
+    mov rax, 3
     jmp parse_udp_done
 parse_udp_check_colon:
     cmp byte [r12], ':'
     jne parse_udp_noport
     inc r12
     mov rsi, r12
-    mov rdi, port_buf
+    mov rdi, parsed_port
     mov rcx, 15
 parse_udp_copy_port:
     mov al, [rsi]
@@ -304,17 +325,25 @@ parse_udp_copy_port:
 parse_udp_port_copied:
     xor al, al
     stosb
-    mov rsi, port_buf
+    mov rsi, parsed_port
     call parse_port
     test rax, rax
     jz parse_udp_err_port
     xor rax, rax
     jmp parse_udp_done
 parse_udp_err_port:
-    mov r13, 4
+    mov rax, 4
+    jmp parse_udp_done
+parse_udp_err_userinfo:
+    mov rax, 11
+    jmp parse_udp_done
+parse_udp_err_query:
+    mov rax, 12
+    jmp parse_udp_done
+parse_udp_err_fragment:
+    mov rax, 13
 parse_udp_done:
     pop r14
-    pop r13
     pop r12
     ret
 parse_unix:
@@ -393,7 +422,6 @@ parse_unix_err_q:
 parse_unix_err_f:
     mov rax, 8
 parse_unix_done_e:
-    mov r13, rax
 parse_unix_done:
     pop r12
     ret
@@ -526,6 +554,8 @@ create_socket_fail:
     xor rax, rax
     ret
 output_success:
+    mov rsi, ok_prefix
+    call write_str
     mov al, [parsed_transport]
     cmp al, 1
     je output_success_out_udp
@@ -611,7 +641,6 @@ write_str_found:
 
 parse_error_msgs:
     dq err_scheme
-    dq 0
     dq err_udp_nohost
     dq err_udp_noport
     dq err_udp_port
@@ -621,3 +650,6 @@ parse_error_msgs:
     dq err_unix_fragment
     dq err_malformed_pct
     dq err_invalid_hex
+    dq err_userinfo
+    dq err_query
+    dq err_fragment

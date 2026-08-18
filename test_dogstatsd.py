@@ -23,6 +23,7 @@ class TestCase:
     expect_port: Optional[str] = None
     expect_path: Optional[str] = None
     expect_error_contains: Optional[str] = None
+    skip_reason: Optional[str] = None
 
 # Valid test cases
 VALID_CASES = [
@@ -171,6 +172,7 @@ INVALID_CASES = [
         url="udp://localhost\x00:8125",
         expect_success=False,
         expect_error_contains="NUL",
+        skip_reason="Environment variables cannot contain embedded NUL bytes",
     ),
 ]
 
@@ -205,14 +207,27 @@ def parse_output(output: str) -> dict:
     output = output.strip()
     if output.startswith("OK:"):
         result["success"] = True
-        parts = output[3:].split(":")
-        if len(parts) >= 1:
-            result["transport"] = parts[0]
-        if len(parts) >= 3 and result["transport"] == "UDP":
-            result["host"] = parts[1]
-            result["port"] = parts[2] if len(parts) > 2 else None
-        elif len(parts) >= 2 and result["transport"] in ("UDS_DATAGRAM", "UDS_STREAM"):
-            result["path"] = parts[1]
+        payload = output[3:]
+        if payload.startswith("UDP:"):
+            result["transport"] = "UDP"
+            host_and_port = payload[4:]
+            if host_and_port.startswith("["):
+                close = host_and_port.find("]")
+                if close != -1:
+                    result["host"] = host_and_port[1:close]
+                    if close + 1 < len(host_and_port) and host_and_port[close + 1] == ":":
+                        result["port"] = host_and_port[close + 2 :]
+            else:
+                host, sep, port = host_and_port.rpartition(":")
+                if sep:
+                    result["host"] = host
+                    result["port"] = port
+        elif payload.startswith("UDS_DATAGRAM:"):
+            result["transport"] = "UDS_DATAGRAM"
+            result["path"] = payload[len("UDS_DATAGRAM:") :]
+        elif payload.startswith("UDS_STREAM:"):
+            result["transport"] = "UDS_STREAM"
+            result["path"] = payload[len("UDS_STREAM:") :]
     elif output.startswith("ERROR:"):
         result["error"] = output[6:]
     
@@ -221,6 +236,10 @@ def parse_output(output: str) -> dict:
 
 def run_test(tc: TestCase) -> bool:
     """Run a single test case and return True if it passes."""
+    if tc.skip_reason:
+        print(f"  SKIP: {tc.name} - {tc.skip_reason}")
+        return True
+
     env = os.environ.copy()
     
     # Remove the env var if testing unset case
