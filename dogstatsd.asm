@@ -61,6 +61,44 @@ section .bss
 section .text
     global _start
 
+; ---------------------------------------------------------------------------
+; Runtime control flow (locked in by TODO item 1.1)
+;
+; Startup sequence (one-shot, at process start):
+;   1. Walk envp on the stack for DD_DOGSTATSD_URL (no libc getenv).
+;   2. Copy the value into url_buf and run parse_url.
+;   3. On success: create_socket -> connect_socket -> send_loop.
+;
+; Steady state (after parse succeeds):
+;   create_socket   socket() per parsed transport: AF_INET/SOCK_DGRAM for UDP,
+;                   AF_UNIX/SOCK_DGRAM for unix, AF_UNIX/SOCK_STREAM for
+;                   unixstream. The fd is cached in BSS.
+;   connect_socket  connect() is called for all three transports: for UDP it
+;                   pins the default destination and enables ICMP error
+;                   feedback on later sends; for UDS_STREAM it establishes
+;                   the connection; for UDS_DATAGRAM it pins the destination.
+;   send_loop       send metric payload -> sleep 60s -> repeat. (First-send
+;                   timing is decided in TODO 6.3, the sleep syscall in
+;                   TODO 6.1.)
+;
+; Failure policy:
+;   Configuration errors (env var not set, empty value, URL parse/validation
+;   failure): log to stdout and exit(1) immediately. The input is read once
+;   from envp and cannot change while the process runs, so retrying is
+;   pointless.
+;   Transient transport failures before the first send (socket() or connect()
+;   fails): log to stdout, sleep for the retry interval (TODO 1.3), and retry
+;   forever. The process never exits on these.
+;   Runtime failures after the first successful send (send() fails, stream
+;   peer goes away): log to stdout; for stream transports close the fd and
+;   repeat create_socket -> connect_socket; for datagram transports keep the
+;   socket; sleep for the retry interval; resume sending. The process never
+;   exits on these either.
+;
+; Net: in steady state the only exit is exit(1) on configuration errors.
+; (Until the send loop lands, a valid URL still prints OK and exits 0.)
+; ---------------------------------------------------------------------------
+
 _start:
     ; Stack at _start: [rsp]=argc, [rsp+8]=argv[0], ..., [rsp+8*(argc+1)]=NULL, then envp
     mov rcx, [rsp]        ; rcx = argc

@@ -7,6 +7,12 @@ per minute. Each item is intentionally small and has explicit success criteria.
 ## 1. Lock Down Runtime Behavior
 
 ### 1.1 Define the steady-state control flow
+
+Status: decided — see the "Runtime control flow" comment above `_start` in
+`dogstatsd.asm` (also summarized in README.md). Configuration errors exit(1)
+immediately; transient transport failures (socket/connect/send) log, sleep,
+and retry forever.
+
 - Decide the exact `_start` flow after `parse_url` succeeds:
   `create_socket` -> `connect_socket` when needed -> `send_loop`.
 - Decide whether the process should exit immediately on startup failures or keep

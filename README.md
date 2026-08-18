@@ -46,6 +46,26 @@ empty`, `unknown scheme`, `UDP requires port`, `UDP port out of range`,
 `socket creation failed`, and friends (see the `err_*` strings in
 `dogstatsd.asm`).
 
+### Locked-in runtime flow and failure policy (TODO 1.1)
+
+The steady-state control flow is decided and written as a comment above
+`_start` in `dogstatsd.asm`; TODO items 2–8 will implement it:
+
+- After a successful parse: `create_socket` → `connect_socket` →
+  `send_loop` (send metric → sleep 60s → repeat).
+- `connect()` is used for all three transports: it pins the destination for
+  datagram sockets and establishes stream connections.
+- **Configuration errors** (env var missing/empty, URL parse failure) log to
+  stdout and exit with code 1; they are never retried because the input
+  cannot change at runtime.
+- **Transient transport failures** (socket/connect before the first send,
+or a failed send after steady state is reached) log to stdout, sleep for
+  the retry interval, and retry forever — the process does not exit on
+  them.
+
+The current binary still stops after printing `OK:`; the loop above is the
+design target.
+
 ## Build
 
 The toolchain comes from the Nix flake (`nasm` + binutils `ld`); neither is
