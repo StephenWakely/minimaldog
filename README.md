@@ -52,12 +52,12 @@ The steady-state control flow is decided and written as a comment above
 `_start` in `dogstatsd.asm`; TODO items 2–8 will implement it:
 
 - After a successful parse: `create_socket` → `connect_socket` →
-  `send_loop` (send metric → sleep 60s → repeat).
+  `send_loop` (send metric → sleep for the interval → repeat).
 - `connect()` is used for all three transports: it pins the destination for
   datagram sockets and establishes stream connections.
-- **Configuration errors** (env var missing/empty, URL parse failure) log to
-  stdout and exit with code 1; they are never retried because the input
-  cannot change at runtime.
+- **Configuration errors** (env var missing/empty, URL parse failure,
+  unsupported hostname, malformed numeric IP) log to stdout and exit with
+  code 1; they are never retried because the input cannot change at runtime.
 - **Transient transport failures** (socket/connect before the first send,
 or a failed send after steady state is reached) log to stdout, sleep for
   the retry interval, and retry forever — the process does not exit on
@@ -65,6 +65,28 @@ or a failed send after steady state is reached) log to stdout, sleep for
 
 The current binary still stops after printing `OK:`; the loop above is the
 design target.
+
+### Metric payload (TODO 1.2)
+
+Until metric configurability exists, every interval the client sends this
+exact 24-byte counter payload:
+
+```
+minimaldog.heartbeat:1|c
+```
+
+No tags in v1; the name/type are fixed.
+
+### Retry policy (TODO 1.3)
+
+- `socket()` fails → log, sleep for the retry interval, retry forever.
+- `connect()` fails → log, sleep for the retry interval, retry forever
+  (stream and datagram alike).
+- `send()` fails after running → log; stream transports close the fd and
+  repeat create + connect, datagram transports keep the socket; sleep for
+  the retry interval, resume sending.
+- The retry interval **is** the metric interval: one constant, default
+  60 seconds.
 
 ## Build
 

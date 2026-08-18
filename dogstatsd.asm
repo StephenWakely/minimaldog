@@ -77,23 +77,28 @@ section .text
 ;                   pins the default destination and enables ICMP error
 ;                   feedback on later sends; for UDS_STREAM it establishes
 ;                   the connection; for UDS_DATAGRAM it pins the destination.
-;   send_loop       send metric payload -> sleep 60s -> repeat. (First-send
-;                   timing is decided in TODO 6.3, the sleep syscall in
-;                   TODO 6.1.)
+;   send_loop       send metric payload -> sleep for the interval -> repeat.
+;                   The first send is immediate after connect (TODO 6.3);
+;                   sleeping uses nanosleep (TODO 6.1).
 ;
-; Failure policy:
+; Metric payload (decided in TODO 1.2): the fixed counter
+;   minimaldog.heartbeat:1|c
+; is sent every interval. No tags in v1.
+;
+; Failure policy (decided in TODO 1.3):
 ;   Configuration errors (env var not set, empty value, URL parse/validation
-;   failure): log to stdout and exit(1) immediately. The input is read once
-;   from envp and cannot change while the process runs, so retrying is
-;   pointless.
+;   failure, unsupported hostname, malformed numeric IP): log to stdout and
+;   exit(1) immediately. The input is read once from envp and cannot change
+;   while the process runs, so retrying is pointless.
 ;   Transient transport failures before the first send (socket() or connect()
-;   fails): log to stdout, sleep for the retry interval (TODO 1.3), and retry
-;   forever. The process never exits on these.
+;   fails): log to stdout, sleep for the retry interval, and retry forever.
+;   The process never exits on these.
 ;   Runtime failures after the first successful send (send() fails, stream
 ;   peer goes away): log to stdout; for stream transports close the fd and
 ;   repeat create_socket -> connect_socket; for datagram transports keep the
 ;   socket; sleep for the retry interval; resume sending. The process never
 ;   exits on these either.
+;   Retry interval = metric interval (one constant, default 60s).
 ;
 ; Net: in steady state the only exit is exit(1) on configuration errors.
 ; (Until the send loop lands, a valid URL still prints OK and exits 0.)

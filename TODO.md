@@ -26,6 +26,10 @@ Success criteria:
   failures.
 
 ### 1.2 Define the metric payload format
+
+Status: decided — fixed counter `minimaldog.heartbeat:1|c` (24 bytes), no
+tags; documented in README and the `_start` comment.
+
 - Pick a concrete metric name to send until configurability exists.
 - Pick a metric type, likely a counter or gauge, and the exact wire format.
 - Decide whether to include tags in the first implementation.
@@ -37,6 +41,11 @@ Success criteria:
 - The assembly implementation can build that payload without guessing.
 
 ### 1.3 Decide retry policy
+
+Status: decided — socket/connect/send failures log, sleep for the retry
+interval (= metric interval, default 60s), and retry forever; documented in
+README and the `_start` comment.
+
 - Decide what happens if socket creation fails.
 - Decide what happens if `connect` fails for stream transports.
 - Decide what happens if `send` fails after the program has been running.
