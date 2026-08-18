@@ -1,4 +1,5 @@
-.codex
-probe
-result
-trace.*
+__pycache__/
+*.pyc
+dogstatsd
+dogstatsd.o
+result/
