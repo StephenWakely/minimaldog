@@ -40,6 +40,21 @@ section .data
     SOCK_DGRAM equ 1
     SOCK_STREAM equ 2
     IPPROTO_UDP equ 17
+
+; --- sockaddr layout constants (TODO 3.1) -----------------------------------
+; Every offset the address builders write is named here; no magic numbers in
+; address-building code.
+    SUN_PATH_MAX equ 108        ; max sun_path length including NUL
+    SOCKADDR_UN_LEN equ 110     ; sizeof(struct sockaddr_un)
+    SOCKADDR_IN_LEN equ 16      ; sizeof(struct sockaddr_in)
+    SOCKADDR_IN6_LEN equ 28     ; sizeof(struct sockaddr_in6)
+    SA_OFF_FAMILY equ 0         ; sa_family_t
+    SUN_OFF_PATH equ 2          ; sun_path[]
+    SIN_OFF_PORT equ 2          ; sin_port (network byte order)
+    SIN_OFF_ADDR equ 4          ; sin_addr.s_addr (4 bytes)
+    SIN6_OFF_PORT equ 2         ; sin6_port (network byte order)
+    SIN6_FLOWINFO equ 4         ; sin6_flowinfo
+    SIN6_OFF_ADDR equ 12        ; sin6_addr (16 bytes)
     
     SYS_write equ 1
     SYS_exit equ 60
@@ -499,15 +514,18 @@ hex_to_val:
     cmp al, '9'
     jbe hex_to_val_digit
     cmp al, 'A'
-    jb hex_to_val_inv
+    jb hex_to_val_lower
     cmp al, 'F'
-    jbe hex_to_val_upper
+    ja hex_to_val_lower
+    sub al, 'A'
+    add al, 10
+    ret
+hex_to_val_lower:
     cmp al, 'a'
     jb hex_to_val_inv
     cmp al, 'f'
     ja hex_to_val_inv
-hex_to_val_upper:
-    sub al, 'A'
+    sub al, 'a'
     add al, 10
     ret
 hex_to_val_digit:
@@ -582,6 +600,293 @@ strncmp_done:
     pop rsi
     pop rcx
     ret
+; --- Address construction (TODO 3.2-3.5) ------------------------------------
+; All builders write into sockaddr_buf and set [socklen]. They return 0 on
+; success and a nonzero error code on failure:
+;   build_unix_addr: 1 = path too long for sun_path
+;   build_ipv4_addr: 1 = not a valid dotted-quad numeric address (this is how
+;                    unsupported hostnames are detected, TODO 3.5)
+;   build_ipv6_addr: 1 = malformed IPv6 text
+;
+; v1 scope (TODO 3.5): no DNS resolution. Only numeric IP literals connect;
+; udp://localhost:8125 is a deterministic startup error.
+
+; build_unix_addr: sockaddr_un from parsed_path (single source of truth).
+build_unix_addr:
+    mov rsi, parsed_path
+    xor ecx, ecx              ; path length
+bua_len:
+    mov al, [rsi+rcx]
+    test al, al
+    jz bua_done
+    inc rcx
+    jmp bua_len
+bua_done:
+    cmp rcx, SUN_PATH_MAX - 1 ; leave room for the NUL inside sun_path
+    ja bua_toolong
+    mov word [sockaddr_buf + SA_OFF_FAMILY], AF_UNIX
+    lea rdi, [sockaddr_buf + SUN_OFF_PATH]
+    movzx rax, ecx            ; save len: rep movsb zeroes rcx
+    rep movsb                 ; copy the path
+    mov byte [rdi], 0         ; NUL terminator
+    add eax, 3                ; 2 (family) + len + 1 (NUL)
+    mov [socklen], ax
+    xor rax, rax
+    ret
+bua_toolong:
+    mov rax, 1
+    ret
+
+; build_ipv4_addr: sockaddr_in from parsed_host (dotted quad) and the cached
+; binary port. Rejects anything that is not exactly four octets of 0-255.
+build_ipv4_addr:
+    mov rsi, parsed_host
+    xor rbx, rbx              ; octet index 0..3
+biva_octet:
+    xor r12d, r12d            ; octet value
+    xor r13b, r13b            ; digit seen
+biva_digits:
+    movzx rax, byte [rsi]
+    cmp al, '0'
+    jb biva_end_octet         ; '.' or NUL ends the octet
+    cmp al, '9'
+    ja biva_invalid           ; any other char (hostnames) is rejected
+    sub al, '0'
+    movzx rax, al
+    imul r12d, r12d, 10
+    add r12d, eax
+    mov r13b, 1
+    inc rsi
+    jmp biva_digits
+biva_end_octet:
+    test r13b, r13b
+    jz biva_invalid           ; empty octet: leading '.', '..', or trailing '.'
+    cmp r12d, 255
+    ja biva_invalid
+    mov al, r12b
+    lea r12, [sockaddr_buf + SIN_OFF_ADDR]
+    mov [r12+rbx], al
+    cmp byte [rsi], '.'
+    jne biva_after_octet
+    inc rsi                   ; skip the dot
+    inc rbx
+    cmp rbx, 4
+    jae biva_invalid          ; a fifth octet
+    jmp biva_octet
+biva_after_octet:
+    cmp rbx, 3                ; exactly four octets consumed...
+    jne biva_invalid
+    cmp byte [rsi], 0         ; ...and the string is over (al holds the
+                              ; last octet here, not the terminator)
+    jnz biva_invalid
+    mov word [sockaddr_buf + SA_OFF_FAMILY], AF_INET
+    movzx rax, word [parsed_port_bin]
+    mov [sockaddr_buf + SIN_OFF_PORT], ax
+    mov word [socklen], SOCKADDR_IN_LEN
+    xor rax, rax
+    ret
+biva_invalid:
+    mov rax, 1
+    ret
+
+; build_ipv6_addr: sockaddr_in6 from bracketed IPv6 text in parsed_host.
+; Supports full 8-group addresses and single "::" compression. Rejects
+; everything else (including IPv4-mapped tails) as malformed in v1.
+build_ipv6_addr:
+    lea rsi, [parsed_host]
+    xor r15b, r15b            ; "::" seen
+    xor r11d, r11d            ; n_right (tokens after "::")
+    lea r8, [rsi]
+b6_scan:
+    movzx rax, byte [r8]
+    test al, al
+    jz b6_scan_done
+    cmp al, ':'
+    jne b6_scan_next
+    cmp byte [r8+1], ':'
+    jne b6_scan_next
+    mov r15b, 1
+    sub r8, rsi               ; r8 = offset of "::"
+    jmp b6_count_right
+b6_scan_next:
+    inc r8
+    jmp b6_scan
+b6_scan_done:
+    sub r8, rsi               ; r8 = total length; no compression
+    mov r14d, r8d
+    lea r8, [rsi + r8]        ; right region start == NUL position
+    mov rdi, r8               ; save (empty right region)
+    jmp b6_fill_left
+b6_count_right:
+    mov r14d, r8d             ; left region length
+    lea r8, [rsi + r8 + 2]    ; right region start
+    mov rdi, r8               ; save; the colon count below walks r8
+    xor r11d, r11d
+    movzx rax, byte [r8]
+    test al, al
+    jz b6_fill_left           ; empty right region: 0 tokens
+    mov r11d, 1
+b6_cr_colons:
+    movzx rax, byte [r8]
+    test al, al
+    jz b6_fill_left
+    cmp al, ':'
+    je b6_cr_inc
+    inc r8
+    jmp b6_cr_colons
+b6_cr_inc:
+    inc r11d
+    inc r8
+    jmp b6_cr_colons
+b6_fill_left:
+    lea r9, [rsi]             ; walk the left region
+    lea r10, [rsi + r14]      ; its end ("::" start or NUL)
+    lea r12, [sockaddr_buf + SIN6_OFF_ADDR]
+    xor eax, eax
+    mov [r12], rax            ; zero the 16-byte address up front
+    mov [r12+8], rax
+    xor rbx, rbx              ; n_left
+    test r14d, r14d
+    jz b6_store_left          ; empty left region (string starts with "::")
+    inc rbx                   ; first token
+b6_count_colon:
+    cmp r9, r10
+    jae b6_trail_check
+    movzx eax, byte [r9]
+    cmp al, ':'
+    je b6_count_inc
+    inc r9
+    jmp b6_count_colon
+b6_count_inc:
+    inc rbx
+    inc r9
+    jmp b6_count_colon
+b6_trail_check:
+    cmp byte [r10 - 1], ':'   ; trailing ':' => empty final group
+    je b6_invalid
+b6_store_left:
+    lea r12, [sockaddr_buf + SIN6_OFF_ADDR]  ; left groups start at the head;
+    lea r9, [rsi]                            ; "::" fills the gap to the right
+b6_left_tok:
+    cmp r9, r10
+    jae b6_left_done
+    xor r13d, r13d            ; group value
+    xor r14b, r14b            ; digit count
+b6_left_digit:
+    movzx rax, byte [r9]
+    test al, al               ; NUL terminates the final group
+    jz b6_left_tok_end
+    cmp al, ':'
+    je b6_left_tok_end
+    call hex_to_val
+    cmp rax, 0xffff
+    je b6_invalid
+    shl r13d, 4
+    add r13d, eax
+    inc r14b
+    cmp r14b, 4
+    ja b6_invalid             ; more than 4 hex digits
+    inc r9
+    jmp b6_left_digit
+b6_left_tok_end:
+    test r14b, r14b
+    jz b6_invalid             ; empty group inside the left region
+    movzx eax, r13w           ; store the group big-endian
+    shr eax, 8
+    mov [r12], al
+    movzx eax, r13w
+    mov [r12+1], al
+    add r12, 2
+    inc r9                    ; skip the ':' separator
+    jmp b6_left_tok
+b6_left_done:
+    mov r9, rdi               ; right region start (== NUL if no compression)
+    xor r10b, r10b            ; "expecting digit" flag (r10 is free now)
+    lea r12, [sockaddr_buf + SIN6_OFF_ADDR + 16]
+    mov r14d, r11d            ; right block: last 2*n_right bytes
+    shl r14d, 1
+    sub r12, r14
+    jmp b6_right_tok
+b6_right_tok:
+    movzx rax, byte [r9]
+    test al, al
+    jz b6_right_nul
+    xor r13d, r13d
+    xor r14b, r14b
+b6_right_digit:
+    movzx rax, byte [r9]
+    test al, al               ; NUL terminates the final group
+    jz b6_right_tok_end
+    cmp al, ':'
+    je b6_right_tok_end
+    call hex_to_val
+    cmp rax, 0xffff
+    je b6_invalid
+    shl r13d, 4
+    add r13d, eax
+    inc r14b
+    cmp r14b, 4
+    ja b6_invalid
+    inc r9
+    jmp b6_right_digit
+b6_right_tok_end:
+    test r14b, r14b
+    jz b6_invalid             ; empty group inside the right region
+    movzx eax, r13w           ; store the group big-endian
+    shr eax, 8
+    mov [r12], al
+    movzx eax, r13w
+    mov [r12+1], al
+    add r12, 2
+    movzx rax, byte [r9]
+    test al, al
+    jz b6_check               ; clean end, no trailing ':'
+    inc r9                    ; skip ':'
+    mov r10b, 1               ; a digit must follow
+    jmp b6_right_tok
+b6_right_nul:
+    test r10b, r10b
+    jnz b6_invalid            ; trailing ':' means an empty final group
+    jmp b6_check
+b6_check:
+    mov eax, ebx              ; n_left + n_right
+    add eax, r11d
+    test r15b, r15b
+    jz b6_check_exact
+    cmp eax, 7
+    ja b6_invalid             ; compression: "::" covers >= 1 zero group,
+                              ; so at most 7 explicit groups
+    jmp b6_ok
+b6_check_exact:
+    cmp eax, 8                ; no compression: exactly 8 groups
+    jne b6_invalid
+b6_ok:
+    mov word [sockaddr_buf + SA_OFF_FAMILY], AF_INET6
+    movzx rax, word [parsed_port_bin]
+    mov [sockaddr_buf + SIN6_OFF_PORT], ax
+    mov dword [sockaddr_buf + SIN6_FLOWINFO], 0
+    mov word [socklen], SOCKADDR_IN6_LEN
+    xor rax, rax
+    ret
+b6_invalid:
+    mov rax, 1
+    ret
+
+; build_addr: dispatch on transport/ipv6 flag. Returns the builder's code.
+build_addr:
+    cmp byte [parsed_transport], 1
+    jne ba_unix
+    test byte [parsed_ipv6], 1
+    jz ba_ipv4
+    call build_ipv6_addr
+    ret
+ba_ipv4:
+    call build_ipv4_addr
+    ret
+ba_unix:
+    call build_unix_addr
+    ret
+
 create_socket:
     mov al, [parsed_transport]
     cmp al, 1

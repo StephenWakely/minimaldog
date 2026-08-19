@@ -20,7 +20,7 @@ Install additional debugging tools by adding them to `devShell.packages` in
 ## Build
 
 ```sh
-nix develop . --command sh -c 'nasm -f elf64 -o dogstatsd dogstatsd.asm && ld -o dogstatsd dogstatsd.o'
+nix develop . --command sh -c 'nasm -f elf64 -o dogstatsd.o dogstatsd.asm && ld -o dogstatsd dogstatsd.o'
 ```
 
 ## Verifying asm behavior

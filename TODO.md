@@ -104,6 +104,11 @@ Success criteria:
 ## 3. Implement Address Construction
 
 ### 3.1 Add constants and layouts for socket addresses
+
+Status: done — `SUN_PATH_MAX`, `SOCKADDR_{UN,IN,IN6}_LEN` and per-field
+offsets (`SA_OFF_FAMILY`, `SUN_OFF_PATH`, `SIN_OFF_PORT/ADDR`,
+`SIN6_OFF_PORT/FLOWINFO/ADDR`) are named; the builders use only these.
+
 - Define constants for `sockaddr_in`, `sockaddr_in6`, and `sockaddr_un`
   structure sizes and relevant fields.
 - Add constants for `htons`-style byte ordering logic where needed.
@@ -113,6 +118,11 @@ Success criteria:
 - No magic numbers remain in address-building code.
 
 ### 3.2 Build Unix socket addresses
+
+Status: done — `build_unix_addr` copies `parsed_path` into `sockaddr_un`
+via `rep movsb`, NUL-terminates, sets `socklen = 2 + len + 1`, and returns
+1 (too long) when the path exceeds `SUN_PATH_MAX - 1`.
+
 - Write a helper that fills a `sockaddr_un` buffer from `parsed_path`.
 - Reject paths that do not fit into the structure.
 - Return a clear error code if the path is too long.
@@ -123,6 +133,11 @@ Success criteria:
 - Oversized paths fail with a deterministic logged error.
 
 ### 3.3 Build IPv4 UDP socket addresses
+
+Status: done — `build_ipv4_addr` parses exactly four 0-255 octets (rejecting
+empty octets, a fifth octet, and any non-digit such as hostnames) and stores
+the cached network-order port from `parsed_port_bin`.
+
 - Decide whether hostname support is limited to numeric IPv4 first or whether
   DNS resolution will be added now.
 - If numeric-only first, implement dotted-quad parsing in assembly.
@@ -133,6 +148,12 @@ Success criteria:
 - Invalid numeric IPv4 addresses fail before any send attempt.
 
 ### 3.4 Build IPv6 UDP socket addresses
+
+Status: done — `build_ipv6_addr` parses full 8-group addresses and single
+"::" compression into big-endian groups in `sockaddr_in6` (flowinfo 0);
+rejects double "::", trailing ":", empty groups, >4 hex digits per group,
+and wrong group counts. Verified by the gdb address-builder suite.
+
 - Decide whether bracketed IPv6 support should remain first-class at connect
   time or be deferred.
 - If supported now, implement binary IPv6 parsing or clearly document that
@@ -144,6 +165,13 @@ Success criteria:
   startup error.
 
 ### 3.5 Decide on DNS hostname resolution
+
+Status: done — v1 is numeric-only: `build_ipv4_addr` rejects hostnames
+(returning 1), so once section 4 wires `build_addr` into the socket path,
+`udp://localhost:8125` becomes a deterministic startup error instead of a
+silent misconnect. A custom DNS client (option 3) remains the likely
+follow-up; the decision is documented in the `build_addr` comments.
+
 - Linux syscalls alone do not provide simple hostname lookup without libc.
 - Decide whether to:
   1. Support numeric IP literals only for the first milestone.
