@@ -13,6 +13,11 @@ corresponding socket, and reports the result on stdout.
 Reads the target from the `DD_DOGSTATSD_URL` environment variable (walked
 manually from the `_start` stack layout — there is no `getenv`).
 
+Optional: `DD_DOGSTATSD_INTERVAL_SECS` overrides the send/retry interval
+(default 60). It must be an integer in 1–3600; anything else is a
+configuration error (exit 1). It exists so integration tests can run with a
+short period — see the timing tests in `test_dogstatsd.py`.
+
 ### Supported URL forms
 
 | URL | Result |
@@ -34,7 +39,7 @@ Validation rules:
 
 ```console
 $ DD_DOGSTATSD_URL=udp://127.0.0.1:8125 ./dogstatsd
-OK:UDP:127.0.0.1:8125            # exit 0
+OK:UDP:127.0.0.1:8125            # then keeps running (send loop)
 
 $ DD_DOGSTATSD_URL=udp://localhost:8125 ./dogstatsd
 ERROR:unsupported host (numeric IPv4 required in v1)   # exit 1
@@ -43,11 +48,16 @@ $ DD_DOGSTATSD_URL=gopher://x:1 ./dogstatsd
 ERROR:unknown scheme             # exit 1
 ```
 
+The `OK:` line is printed exactly once, at startup. After that the process
+runs indefinitely; a runtime send failure prints one `ERROR:` line per
+failed interval (e.g. `ERROR:send failed`) and retries.
+
 Error messages include `DD_DOGSTATSD_URL not set`, `DD_DOGSTATSD_URL is
 empty`, `unknown scheme`, `UDP requires port`, `UDP port out of range`,
 `Unix socket path must be absolute`, `malformed percent escape`,
-`socket creation failed`, `connect failed`, `send failed`, and friends
-(see the `err_*` strings in `dogstatsd.asm`).
+`socket creation failed`, `connect failed`, `send failed`,
+`DD_DOGSTATSD_INTERVAL_SECS must be 1-3600`, and friends (see the `err_*`
+strings in `dogstatsd.asm`).
 
 ### Locked-in runtime flow and failure policy (TODO 1.1)
 
@@ -66,15 +76,16 @@ or a failed send after steady state is reached) log to stdout, sleep for
   the retry interval, and retry forever — the process does not exit on
   them.
 
-The current binary sends one metric immediately after connecting, then
-prints `OK:` and exits 0; the periodic loop above is the remaining design
-target (TODO 6.4).
+The first send is immediate after connecting; every later send is one
+interval after the previous one (or after a failed attempt's retry sleep).
+`SIGPIPE` is ignored at startup via `rt_sigaction`, so a stream peer going
+away surfaces as `-EPIPE` from `write()` and takes the failure path above
+instead of killing the process.
 
 ### Metric payload (TODO 1.2)
 
 Until metric configurability exists, the client sends this exact 24-byte
-counter payload on every interval (one immediate send at startup until the
-periodic loop lands in TODO 6.4):
+counter payload on every interval (the first send is immediate at startup):
 
 ```
 minimaldog.heartbeat:1|c

@@ -29,6 +29,8 @@ class TestCase:
     # When set ("dgram" or "stream"), a live Unix socket peer is bound at
     # expect_path for the duration of the case (connection-setup tests).
     peer_kind: Optional[str] = None
+    # Extra environment variables for the case (TODO 8.5 interval override).
+    extra_env: Optional[dict] = None
     skip_reason: Optional[str] = None
 
 # Valid test cases
@@ -389,6 +391,95 @@ def run_first_send_timing_case(name: str) -> bool:
     return True
 
 
+def run_send_period_short_case(name: str, interval: int = 2) -> bool:
+    """Second metric arrives ~interval after the first (TODO 8.5 fast loop)."""
+    env = os.environ.copy()
+    proc = None
+    try:
+        with udp_listener() as (lsn, url):
+            env["DD_DOGSTATSD_URL"] = url
+            env["DD_DOGSTATSD_INTERVAL_SECS"] = str(interval)
+            proc = subprocess.Popen(
+                [EXECUTABLE],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            lsn.settimeout(5)
+            data1, _ = lsn.recvfrom(65536)
+            t1 = time.monotonic()
+            lsn.settimeout(10)
+            data2, _ = lsn.recvfrom(65536)
+            dt = time.monotonic() - t1
+            if data1 != EXPECTED_METRIC or data2 != EXPECTED_METRIC:
+                print(f"  FAIL: {name} - bad payload ({data1!r}, {data2!r})")
+                return False
+            if not (interval * 0.75 <= dt <= interval + 8.0):
+                print(f"  FAIL: {name} - second send after {dt:.1f}s; "
+                      f"expected ~{interval}s")
+                return False
+    except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
+        print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    return True
+
+
+def run_reconnect_epipe_case(name: str, interval: int = 2) -> bool:
+    """Stream peer closes after the first metric (TODO 8.4): the client must
+    log the send failure, survive SIGPIPE, and reconnect on a later cycle."""
+    env = os.environ.copy()
+    proc = None
+    try:
+        with uds_listener("/tmp/minimaldog-test/reconnect.sock", "stream") as (lsn, url):
+            env["DD_DOGSTATSD_URL"] = url
+            env["DD_DOGSTATSD_INTERVAL_SECS"] = str(interval)
+            proc = subprocess.Popen(
+                [EXECUTABLE],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            lsn.settimeout(10)
+            conn, _ = lsn.accept()
+            data1 = conn.recv(len(EXPECTED_METRIC))
+            t_close = time.monotonic()
+            conn.close()  # peer goes away -> EPIPE on the client's next write
+            lsn.settimeout(interval * 3 + 10)
+            conn2, _ = lsn.accept()  # reconnection on a later cycle
+            data2 = conn2.recv(len(EXPECTED_METRIC))
+            dt = time.monotonic() - t_close
+            conn2.close()
+            if data1 != EXPECTED_METRIC or data2 != EXPECTED_METRIC:
+                print(f"  FAIL: {name} - bad payload ({data1!r}, {data2!r})")
+                return False
+            if not (interval * 0.5 <= dt <= interval * 3 + 10):
+                print(f"  FAIL: {name} - reconnected after {dt:.1f}s; "
+                      f"expected within ~{interval * 3 + 10}s")
+                return False
+    except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
+        print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proc is not None:
+            out, _ = proc.communicate(timeout=5)
+            text = out.decode(errors="replace") if isinstance(out, bytes) else (out or "")
+            lines = [l for l in text.splitlines() if l.strip()]
+            if not lines or not lines[0].startswith("OK:"):
+                print(f"  FAIL: {name} - missing OK startup report: {text!r}")
+                return False
+            if not any("ERROR" in l and "send failed" in l for l in lines):
+                print(f"  FAIL: {name} - missing 'ERROR:send failed' after EPIPE: {text!r}")
+                return False
+    return True
+
+
 def run_send_period_case(name: str) -> bool:
     """Second metric arrives ~60s after the first (TODO 6.4). Slow test."""
     env = os.environ.copy()
@@ -438,6 +529,8 @@ def run_test(tc: TestCase) -> bool:
         env.pop("DD_DOGSTATSD_URL", None)
     else:
         env["DD_DOGSTATSD_URL"] = tc.url
+    if tc.extra_env:
+        env.update(tc.extra_env)
     
     peer = unix_peer(tc.expect_path, tc.peer_kind) if tc.peer_kind else nullcontext()
     with peer:
@@ -546,10 +639,52 @@ def main():
             failed += 1
     
     print()
-    print("Timing tests (TODO 6.3/6.4):")
-    total = len(all_cases) + len(send_cases) + 1
+    print("Interval override tests (TODO 8.5):")
+    interval_cases = [
+        TestCase(name="interval_zero", url="udp://127.0.0.1:8125",
+                 expect_success=False, expect_error_contains="interval",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": "0"}),
+        TestCase(name="interval_non_numeric", url="udp://127.0.0.1:8125",
+                 expect_success=False, expect_error_contains="interval",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": "abc"}),
+        TestCase(name="interval_negative", url="udp://127.0.0.1:8125",
+                 expect_success=False, expect_error_contains="interval",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": "-5"}),
+        TestCase(name="interval_empty", url="udp://127.0.0.1:8125",
+                 expect_success=False, expect_error_contains="interval",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": ""}),
+        TestCase(name="interval_too_large", url="udp://127.0.0.1:8125",
+                 expect_success=False, expect_error_contains="interval",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": "3601"}),
+        TestCase(name="interval_overflow", url="udp://127.0.0.1:8125",
+                 expect_success=False, expect_error_contains="interval",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": "99999999999999999999"}),
+        TestCase(name="interval_one_accepted", url="udp://127.0.0.1:8125",
+                 expect_success=True, expect_transport="UDP",
+                 extra_env={"DD_DOGSTATSD_INTERVAL_SECS": "1"}),
+    ]
+    for tc in interval_cases:
+        if run_test(tc):
+            print(f"  PASS: {tc.name}")
+            passed += 1
+        else:
+            failed += 1
+
+    print()
+    print("Timing tests (TODO 6.3/6.4/8.4/8.5):")
+    total = len(all_cases) + len(send_cases) + len(interval_cases) + 3
     if run_first_send_timing_case("first_send_immediate"):
         print("  PASS: first_send_immediate")
+        passed += 1
+    else:
+        failed += 1
+    if run_send_period_short_case("send_period_short_2s"):
+        print("  PASS: send_period_short_2s")
+        passed += 1
+    else:
+        failed += 1
+    if run_reconnect_epipe_case("reconnect_after_epipe"):
+        print("  PASS: reconnect_after_epipe")
         passed += 1
     else:
         failed += 1

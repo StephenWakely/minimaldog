@@ -5,6 +5,7 @@
 
 section .data
     env_var_name: db "DD_DOGSTATSD_URL", 0
+    env_interval_name: db "DD_DOGSTATSD_INTERVAL_SECS", 0   ; TODO 8.5
     ok_prefix: db "OK:", 0
     err_prefix: db "ERROR:", 0
     transport_udp: db "UDP", 0
@@ -35,6 +36,7 @@ section .data
     err_bad_host: db "unsupported host (numeric IPv4 required in v1)", 0
     err_bad_v6: db "malformed IPv6 address", 0
     err_path_too_long: db "unix path too long", 0
+    err_interval: db "DD_DOGSTATSD_INTERVAL_SECS must be 1-3600", 0
     
 ; Metric payload (TODO 1.2/5.1): fixed counter, no tags. The send path uses
 ; metric_payload + metric_len directly; nothing is assembled at runtime.
@@ -209,6 +211,23 @@ _start:
     jnz start_parse_error
     ; TODO 1.3: one constant for the metric and the retry interval.
     mov dword [interval_secs], 60
+    ; TODO 8.5: optional test hook — DD_DOGSTATSD_INTERVAL_SECS overrides the
+    ; send/retry period so integration tests can run with a short interval;
+    ; the production default above applies when the variable is unset.
+    ; An invalid value is a configuration error (exit 1), like a bad URL.
+    mov rdi, env_interval_name
+    call find_env
+    test rax, rax
+    jz interval_ok
+    mov rsi, rax
+    call parse_interval
+    test rax, rax
+    jnz interval_ok
+start_bad_interval:
+    mov rdi, err_interval
+    call output_error
+    jmp start_exit_error
+interval_ok:
 startup_retry:               ; pre-first-send failures retry forever (TODO 4.2)
     call close_socket         ; discard a failed socket from a previous pass;
                               ; no-op on the first iteration ([socket_fd] == 0)
@@ -687,6 +706,44 @@ parse_port_chk:
     mov rax, 1
 parse_port_done:
     pop rdx
+    pop rsi
+    ret
+
+; parse_interval(rsi = NUL-terminated decimal) -> rax = 1 and [interval_secs]
+; set when the value is an integer in 1..3600, else rax = 0 (TODO 8.5).
+; Clobbers bl/rcx; saves rsi.
+parse_interval:
+    push rsi
+    xor rax, rax          ; accumulator
+    xor rdx, rdx          ; digit count
+parse_interval_loop:
+    mov bl, [rsi]
+    cmp bl, 0
+    je parse_interval_chk
+    cmp bl, '0'
+    jb parse_interval_inv
+    cmp bl, '9'
+    ja parse_interval_inv
+    sub bl, '0'
+    movzx rcx, bl
+    imul rax, rax, 10
+    add rax, rcx
+    cmp rax, 3600         ; a decimal value only grows: reject early so the
+    ja parse_interval_inv ; accumulator can never overflow (<= 36009 here)
+    inc rdx
+    inc rsi
+    jmp parse_interval_loop
+parse_interval_inv:
+    xor rax, rax
+    jmp parse_interval_done
+parse_interval_chk:
+    test rdx, rdx
+    jz parse_interval_inv
+    test rax, rax
+    jz parse_interval_inv ; 0 would busy-loop the send loop
+    mov [interval_secs], eax
+    mov rax, 1
+parse_interval_done:
     pop rsi
     ret
 

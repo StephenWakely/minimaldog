@@ -309,6 +309,13 @@ Success criteria:
 
 ## 6. Implement Time-Based Scheduling
 
+Status: done — all of 6.1–6.4 landed. `nanosleep` is the one sleep syscall
+(6.1); `sleep_interval` resumes its remaining duration on EINTR (6.2); the
+first send is immediate after connect and every later send is one interval
+later (6.3); the steady-state `send_loop` runs indefinitely, ignoring
+SIGPIPE so a stream peer going away takes the retry path instead of killing
+the process (6.4). See the comment above `_start` in `dogstatsd.asm`.
+
 ### 6.1 Choose the sleep mechanism
 - Decide whether to use `nanosleep` or `clock_nanosleep`.
 - Prefer a monotonic-clock-based approach if drift matters.
@@ -403,6 +410,10 @@ Success criteria:
 - Each deliberately unsupported input has a deterministic failure test.
 
 ### 8.3 Add periodic-send integration tests
+Status: done — `send_period_60s` (slow, `RUN_SLOW_TESTS=1`) and
+`send_period_short_2s` (fast, via the TODO 8.5 interval override) both
+capture two metrics over a local UDP listener and assert the payload plus
+the inter-send gap.
 - Use a local UDP listener or Unix socket listener in Python to capture one or
   more emitted metrics.
 - Verify payload correctness and that repeated sends occur roughly once per
@@ -414,6 +425,11 @@ Success criteria:
 - The received payload exactly matches the documented metric string.
 
 ### 8.4 Add reconnection and error-path tests
+Status: done — `reconnect_after_epipe` closes a live stream peer after the
+first metric and asserts the client logs `ERROR:send failed`, survives the
+EPIPE, and reconnects on a later cycle (interval override keeps it fast).
+Startup socket/connect failure logging is covered by the existing
+connection-setup cases (`unix_datagram_no_peer` and friends).
 - Test startup socket failure logging.
 - Test send failure after initial success and confirm retry behavior.
 - Test stream partial-write handling if stream transport remains supported.
@@ -423,6 +439,10 @@ Success criteria:
 - Error logs are asserted, not just manually inspected.
 
 ### 8.5 Add a test mode for faster feedback
+Status: done — `DD_DOGSTATSD_INTERVAL_SECS` (integer 1–3600, anything else is
+a configuration error) overrides the send/retry interval; production default
+stays 60. Parsed by `parse_interval` in `dogstatsd.asm`; exercised by the
+`interval_*` cases and the fast timing tests.
 - Introduce an environment variable or build-time constant for the send interval
   so tests can run with a short period like 1 second.
 - Keep production default at 60 seconds.
