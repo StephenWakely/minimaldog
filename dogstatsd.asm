@@ -1,5 +1,6 @@
 ; Minimal DogStatsD Client - x86-64 Assembly
-; Parses DD_DOGSTATSD_URL and creates appropriate socket
+; Parses DD_DOGSTATSD_URL, connects the corresponding socket, and emits
+; one DogStatsD metric.
 ; NASM syntax, Linux x86-64
 
 section .data
@@ -30,10 +31,16 @@ section .data
     err_unix_fragment: db "fragment not allowed in unix URL", 0
     err_socket_create: db "socket creation failed", 0
     err_connect: db "connect failed", 0
+    err_send: db "send failed", 0
     err_bad_host: db "unsupported host (numeric IPv4 required in v1)", 0
     err_bad_v6: db "malformed IPv6 address", 0
     err_path_too_long: db "unix path too long", 0
     
+; Metric payload (TODO 1.2/5.1): fixed counter, no tags. The send path uses
+; metric_payload + metric_len directly; nothing is assembled at runtime.
+    metric_payload: db "minimaldog.heartbeat:1|c"
+    metric_len equ $ - metric_payload      ; 24 bytes
+
     scheme_udp: db "udp://", 0
     scheme_unix: db "unix://", 0
     scheme_unixstream: db "unixstream://", 0
@@ -151,10 +158,11 @@ section .text
 ;   the startup retry loop, which closes any live fd before reopening.
 ;   After a successful send: stream transports close and reconnect on any
 ;   send failure; datagram transports keep the socket and simply retry the
-;   send (implemented in TODO 5/6 when sending exists).
+;   send (implemented in TODO 6.4).
 ;
 ; Net: in steady state the only exit is exit(1) on configuration errors.
-; (Until the send loop lands, a valid URL still prints OK and exits 0.)
+; (Until the periodic loop lands (TODO 6.4), a valid URL sends one metric,
+; prints OK, and exits 0.)
 ; ---------------------------------------------------------------------------
 
 _start:
@@ -213,8 +221,11 @@ startup_addr_ok:
     call connect_socket
     test rax, rax
     jz startup_conn_fail
-    ; The socket is up. Until the send loop lands (TODO 5/6), report success
-    ; and exit(0).
+    ; First send is immediate after connect (TODO 6.3). Until the periodic
+    ; loop lands (TODO 6.4), one successful send then report and exit(0).
+    call send_metric_once
+    test rax, rax
+    jz startup_send_fail
     call output_success
     jmp start_exit_success
 startup_sock_fail:
@@ -223,6 +234,9 @@ startup_sock_fail:
     jmp startup_sleep
 startup_conn_fail:
     mov rdi, err_connect
+    call output_error
+startup_send_fail:
+    mov rdi, err_send
     call output_error
 startup_sleep:
     call sleep_interval
@@ -1023,6 +1037,41 @@ close_socket:
     syscall
 close_done:
     mov dword [socket_fd], 0
+    ret
+
+; send_metric_once (TODO 5.2-5.4): write metric_payload over [socket_fd].
+; Syscall strategy (TODO 5.2): write(2) — SYS_write = 1, rdi=fd, rsi=buf,
+; rdx=len -> rax = bytes written or -errno. Every supported transport is
+; connected before sending, so write() reaches the pinned destination on all
+; of them; sendto/send would add arguments for no benefit.
+; Partial writes (TODO 5.4): stream transports loop until the whole payload
+; is out; datagram transports treat any short write as failure — a truncated
+; datagram is already on the wire and must not be retried.
+; Returns 1 on success, 0 on failure. No logging here (TODO 5.3); the caller
+; owns error reporting. [socket_fd] is left untouched on failure.
+send_metric_once:
+    mov eax, [socket_fd]
+    test eax, eax
+    jz smo_fail
+    lea rsi, [metric_payload]
+    mov edx, metric_len
+smo_write:
+    mov edi, eax              ; fd (kept in eax across the loop)
+    mov rax, SYS_write
+    syscall
+    cmp rax, 0
+    jbe smo_fail              ; <= 0: -errno or an anomalous 0-byte write
+    add rsi, rax              ; advance past the bytes that went out
+    sub edx, eax
+    jz smo_ok                 ; whole payload sent
+    cmp byte [parsed_transport], 3
+    jne smo_fail              ; datagram (udp/unix dgram): short write = fail
+    jmp smo_write             ; stream: keep writing the remainder
+smo_ok:
+    mov rax, 1
+    ret
+smo_fail:
+    xor rax, rax
     ret
 
 ; sleep_interval (TODO 6.1/6.2, pulled forward for the retry loop):

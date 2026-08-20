@@ -270,6 +270,75 @@ def unix_peer(path: str, kind: str):
             pass
 
 
+# Expected wire payload (TODO 1.2): the fixed counter, no tags.
+EXPECTED_METRIC = b"minimaldog.heartbeat:1|c"
+
+
+@contextmanager
+def udp_listener():
+    """Bind a UDP socket on 127.0.0.1:0; yield (socket, url)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.settimeout(4)
+    try:
+        yield s, f"udp://127.0.0.1:{port}"
+    finally:
+        s.close()
+
+
+@contextmanager
+def uds_listener(path: str, kind: str):
+    """Bind a Unix socket peer at path; yield (socket, url)."""
+    sock_type = socket.SOCK_STREAM if kind == "stream" else socket.SOCK_DGRAM
+    s = socket.socket(socket.AF_UNIX, sock_type)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        s.bind(path)
+        if kind == "stream":
+            s.listen(4)
+        s.settimeout(4)
+        yield s, f"unix{'stream' if kind == 'stream' else ''}://{path}"
+    finally:
+        s.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def run_send_case(name: str, listener, stream: bool) -> bool:
+    """Run the binary against a live listener and verify one metric arrives."""
+    env = os.environ.copy()
+    try:
+        with listener as (lsn, url):
+            env["DD_DOGSTATSD_URL"] = url
+            result = subprocess.run(
+                [EXECUTABLE],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            out = result.stdout + result.stderr
+            if not out.startswith("OK:"):
+                print(f"  FAIL: {name} - expected OK output, got: {out.strip()!r}")
+                return False
+            if stream:
+                conn, _ = lsn.accept()
+                data = conn.recv(len(EXPECTED_METRIC))
+                conn.close()
+            else:
+                data, _ = lsn.recvfrom(65536)
+            if data != EXPECTED_METRIC:
+                print(f"  FAIL: {name} - expected {EXPECTED_METRIC!r}, got {data!r}")
+                return False
+    except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
+        print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
+        return False
+    return True
+
+
 def run_test(tc: TestCase) -> bool:
     """Run a single test case and return True if it passes."""
     if tc.skip_reason:
@@ -371,8 +440,25 @@ def main():
             failed += 1
     
     print()
+    print("Send tests (one metric per case, captured by a local listener):")
+    send_cases = [
+        ("send_udp", udp_listener(), False),
+        ("send_unix_datagram",
+         uds_listener("/tmp/minimaldog-test/send-dg.sock", "dgram"), False),
+        ("send_unix_stream",
+         uds_listener("/tmp/minimaldog-test/send-str.sock", "stream"), True),
+    ]
+    for name, listener, stream in send_cases:
+        if run_send_case(name, listener, stream):
+            print(f"  PASS: {name}")
+            passed += 1
+        else:
+            failed += 1
+    
+    print()
     print("=" * 60)
-    print(f"Results: {passed} passed, {failed} failed out of {len(all_cases)} tests")
+    total = len(all_cases) + len(send_cases)
+    print(f"Results: {passed} passed, {failed} failed out of {total} tests")
     print("=" * 60)
     
     # Show transport mapping summary

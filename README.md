@@ -46,8 +46,8 @@ ERROR:unknown scheme             # exit 1
 Error messages include `DD_DOGSTATSD_URL not set`, `DD_DOGSTATSD_URL is
 empty`, `unknown scheme`, `UDP requires port`, `UDP port out of range`,
 `Unix socket path must be absolute`, `malformed percent escape`,
-`socket creation failed`, and friends (see the `err_*` strings in
-`dogstatsd.asm`).
+`socket creation failed`, `connect failed`, `send failed`, and friends
+(see the `err_*` strings in `dogstatsd.asm`).
 
 ### Locked-in runtime flow and failure policy (TODO 1.1)
 
@@ -66,13 +66,15 @@ or a failed send after steady state is reached) log to stdout, sleep for
   the retry interval, and retry forever — the process does not exit on
   them.
 
-The current binary still stops after printing `OK:`; the loop above is the
-design target.
+The current binary sends one metric immediately after connecting, then
+prints `OK:` and exits 0; the periodic loop above is the remaining design
+target (TODO 6.4).
 
 ### Metric payload (TODO 1.2)
 
-Until metric configurability exists, every interval the client sends this
-exact 24-byte counter payload:
+Until metric configurability exists, the client sends this exact 24-byte
+counter payload on every interval (one immediate send at startup until the
+periodic loop lands in TODO 6.4):
 
 ```
 minimaldog.heartbeat:1|c

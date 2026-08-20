@@ -248,7 +248,16 @@ Success criteria:
 
 ## 5. Implement Metric Emission
 
+Status: done — fixed 24-byte payload in `.data` (`metric_payload`/
+`metric_len`); one send helper (`send_metric_once`) using `write(2)` works
+for all three connected transports; stream sends loop on partial writes,
+datagram sends treat short writes as failure. The first send happens
+immediately after connect (TODO 6.3); the periodic loop is TODO 6.4.
+
 ### 5.1 Add the metric payload buffer
+Status: done — `metric_payload` (`minimaldog.heartbeat:1|c`, 24 bytes) in
+`.data` with `metric_len`; the send path uses the pointer and exact length
+directly, nothing assembled at runtime.
 - Store the metric payload in `.data` if it is fixed.
 - If some fields are dynamic, add a helper to assemble the payload into a
   mutable buffer.
@@ -257,6 +266,11 @@ Success criteria:
 - The send path has a buffer pointer and exact byte length before syscall time.
 
 ### 5.2 Choose the send syscall strategy
+Status: decided — `write(2)`: SYS_write = 1, rdi=fd, rsi=buf, rdx=len;
+rax = bytes written or -errno. Every supported transport is connected before
+sending, so write() reaches the pinned destination on all of them; sendto/
+send would add arguments for no benefit. Recorded in the comment above
+`send_metric_once`.
 - Decide between `write`, `sendto`, or `send`.
 - Prefer the smallest implementation that works with connected sockets across
   the supported transports.
@@ -267,6 +281,11 @@ Success criteria:
 - The helper works for every supported transport class.
 
 ### 5.3 Implement `send_metric_once`
+Status: done — sends `metric_payload` over `[socket_fd]`, returns 1/0, no
+logging inside (the caller reports errors); `[socket_fd]` is untouched on
+failure. Verified end to end: a local listener receives exactly the 24-byte
+payload on UDP, Unix datagram, and Unix stream (`send_*` cases in
+test_dogstatsd.py).
 - Send the exact metric payload over the already connected fd.
 - Return success or a small error code.
 - Do not mix logging with the send helper itself unless needed for simplicity.
@@ -276,6 +295,10 @@ Success criteria:
 - Failed syscalls return control to the caller without corrupting state.
 
 ### 5.4 Handle partial writes for stream sockets
+Status: done — stream transports loop until the full payload is written or
+an error occurs; datagram transports fail on any short write (a truncated
+datagram must not be retried). A deterministic automated send-failure test
+needs a test hook and is deferred to TODO 8.4.
 - For `SOCK_STREAM`, loop until the whole payload is written or an error occurs.
 - For datagram sockets, treat short writes as failure because the message must
   remain atomic.
