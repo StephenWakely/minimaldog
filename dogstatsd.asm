@@ -44,6 +44,12 @@ section .data
     scheme_udp: db "udp://", 0
     scheme_unix: db "unix://", 0
     scheme_unixstream: db "unixstream://", 0
+
+; struct sigaction for ignoring SIGPIPE (TODO 6.4): sa_handler, sa_mask,
+; sa_flags, sa_restorer — 28 bytes.
+    sigpipe_ign: dd SIG_IGN
+                 dq 0
+                 dq 0
     
     AF_INET equ 2
     AF_INET6 equ 10
@@ -72,8 +78,12 @@ ADDR_ERR_HOST equ 1       ; build_ipv4_addr: hostname / non-numeric text
 ADDR_ERR_V6 equ 2         ; build_ipv6_addr: malformed IPv6 text
 ADDR_ERR_PATHLEN equ 3    ; build_unix_addr: path does not fit sun_path
     
+    EINTR equ 4
+    SIGPIPE equ 13
+    SIG_IGN equ 1
     SYS_write equ 1
     SYS_exit equ 60
+    SYS_rt_sigaction equ 13   ; x86-64 has no standalone signal() syscall
     SYS_getenv equ 318
     SYS_close equ 3
     SYS_socket equ 41
@@ -101,6 +111,7 @@ section .bss
     socklen: resw 2           ; length of the address in sockaddr_buf
     interval_secs: resd 4     ; metric and retry interval, default 60 (TODO 1.3)
     sleep_ts: resq 2          ; struct timespec {tv_sec, tv_nsec} for sleep_interval
+    steady_state: resb 1      ; 1 once the first send has succeeded (TODO 6.4)
     parse_only: resb 1        ; DD_DOGSTATSD_PARSE_ONLY set -> print OK, exit 0
 ; --- Canonical parse results handed to address construction (TODO 2.2/2.3) --
 ; The host stays textual until connect time; the ipv6 flag and the binary
@@ -129,9 +140,10 @@ section .text
 ;                   pins the default destination and enables ICMP error
 ;                   feedback on later sends; for UDS_STREAM it establishes
 ;                   the connection; for UDS_DATAGRAM it pins the destination.
-;   send_loop       send metric payload -> sleep for the interval -> repeat.
+;   send_loop       sleep for the interval -> send metric payload -> repeat.
 ;                   The first send is immediate after connect (TODO 6.3);
-;                   sleeping uses nanosleep (TODO 6.1).
+;                   sleeping uses nanosleep, resuming the remaining time on
+;                   EINTR (TODO 6.1/6.2).
 ;
 ; Metric payload (decided in TODO 1.2): the fixed counter
 ;   minimaldog.heartbeat:1|c
@@ -158,14 +170,23 @@ section .text
 ;   the startup retry loop, which closes any live fd before reopening.
 ;   After a successful send: stream transports close and reconnect on any
 ;   send failure; datagram transports keep the socket and simply retry the
-;   send (implemented in TODO 6.4).
+;   send (implemented in send_loop below).
 ;
-; Net: in steady state the only exit is exit(1) on configuration errors.
-; (Until the periodic loop lands (TODO 6.4), a valid URL sends one metric,
-; prints OK, and exits 0.)
+; Net: in steady state the process never exits; the only exit at all is
+; exit(1) on configuration errors.
 ; ---------------------------------------------------------------------------
 
 _start:
+    ; Ignore SIGPIPE (TODO 6.4): a stream peer going away must surface as
+    ; -EPIPE from write(), not kill the process — the client has to run
+    ; indefinitely through ordinary connection failures.
+    mov eax, SYS_rt_sigaction
+    mov edi, SIGPIPE
+    lea rsi, [sigpipe_ign]
+    xor edx, edx                ; oldact = NULL
+    mov r10d, 8                 ; sigsetsize — 4th syscall arg is R10 on
+                                ; x86-64 (the syscall insn clobbers RCX)
+    syscall
     ; Stack at _start: [rsp]=argc, [rsp+8]=argv[0], ..., [rsp+8*(argc+1)]=NULL, then envp
     mov rcx, [rsp]        ; rcx = argc
     lea rsi, [rsp+8]      ; rsi = argv start
@@ -221,13 +242,34 @@ startup_addr_ok:
     call connect_socket
     test rax, rax
     jz startup_conn_fail
-    ; First send is immediate after connect (TODO 6.3). Until the periodic
-    ; loop lands (TODO 6.4), one successful send then report and exit(0).
+    ; First send after (re)connect is immediate (TODO 6.3).
     call send_metric_once
     test rax, rax
     jz startup_send_fail
-    call output_success
-    jmp start_exit_success
+    cmp byte [steady_state], 1
+    je send_loop               ; steady-state reconnect: resume silently
+    call output_success        ; report exactly once, at startup
+    mov byte [steady_state], 1
+    jmp send_loop
+
+send_loop:                     ; steady state (TODO 6.4): sleep -> send -> repeat
+    call sleep_interval
+    call send_metric_once
+    test rax, rax
+    jz send_fail
+    jmp send_loop
+send_fail:                     ; runtime failure after the first send (TODO 1.3)
+    mov rdi, err_send
+    call output_error
+    cmp byte [parsed_transport], 3
+    je sf_stream               ; stream: fd may be broken; rebuild from scratch
+    call sleep_interval        ; datagram: keep the socket, wait, retry send
+    jmp send_loop
+sf_stream:
+    call close_socket
+    call sleep_interval        ; then recreate + reconnect via startup_retry
+    jmp startup_retry
+
 startup_sock_fail:
     mov rdi, err_socket_create
     call output_error
@@ -1056,11 +1098,15 @@ send_metric_once:
     lea rsi, [metric_payload]
     mov edx, metric_len
 smo_write:
-    mov edi, eax              ; fd (kept in eax across the loop)
+    mov edi, [socket_fd]      ; reload the fd each pass: eax is clobbered by
+                              ; the syscall (return value), so it cannot hold
+                              ; the fd across iterations
     mov rax, SYS_write
     syscall
     cmp rax, 0
-    jbe smo_fail              ; <= 0: -errno or an anomalous 0-byte write
+    jle smo_fail              ; signed <= 0: -errno or an anomalous 0-byte
+                              ; write. (jbe would be wrong: -errno is a huge
+                              ; unsigned value and would fall through here.)
     add rsi, rax              ; advance past the bytes that went out
     sub edx, eax
     jz smo_ok                 ; whole payload sent
@@ -1074,15 +1120,23 @@ smo_fail:
     xor rax, rax
     ret
 
-; sleep_interval (TODO 6.1/6.2, pulled forward for the retry loop):
-; nanosleep for [interval_secs] seconds.
+; sleep_interval (TODO 6.1/6.2): nanosleep for [interval_secs] seconds.
+; Chosen over clock_nanosleep (TODO 6.1): we need a relative interval, not an
+; absolute monotonic deadline, and nanosleep already hands back the remaining
+; time on EINTR, which is all the drift protection this design needs.
+; EINTR policy (TODO 6.2): resume the remaining duration (the kernel writes
+; it back into sleep_ts) instead of restarting the full interval, so repeated
+; interruptions do not accumulate drift.
 sleep_interval:
     mov rax, [interval_secs]
     mov [sleep_ts], rax
     xor qword [sleep_ts+8], 0
     lea rdi, [sleep_ts]
+sleep_loop:
     mov eax, SYS_nanosleep
     syscall
+    cmp rax, -EINTR
+    je sleep_loop
     ret
 output_success:
     mov rsi, ok_prefix

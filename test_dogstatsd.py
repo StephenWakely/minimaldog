@@ -8,6 +8,7 @@ import socket
 import subprocess
 import os
 import sys
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Optional
@@ -310,32 +311,117 @@ def uds_listener(path: str, kind: str):
 def run_send_case(name: str, listener, stream: bool) -> bool:
     """Run the binary against a live listener and verify one metric arrives."""
     env = os.environ.copy()
+    proc = None
     try:
         with listener as (lsn, url):
             env["DD_DOGSTATSD_URL"] = url
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [EXECUTABLE],
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=5,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
-            out = result.stdout + result.stderr
-            if not out.startswith("OK:"):
-                print(f"  FAIL: {name} - expected OK output, got: {out.strip()!r}")
-                return False
             if stream:
                 conn, _ = lsn.accept()
                 data = conn.recv(len(EXPECTED_METRIC))
                 conn.close()
             else:
                 data, _ = lsn.recvfrom(65536)
+            # The process keeps running (send loop); read the startup report
+            # and stop it.
+            proc.kill()
+            out, _ = proc.communicate(timeout=5)
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+            if not out.startswith("OK:"):
+                print(f"  FAIL: {name} - expected OK output, got: {out.strip()!r}")
+                return False
             if data != EXPECTED_METRIC:
                 print(f"  FAIL: {name} - expected {EXPECTED_METRIC!r}, got {data!r}")
                 return False
     except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
         print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
         return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    return True
+
+
+def run_first_send_timing_case(name: str) -> bool:
+    """First metric arrives immediately (TODO 6.3); process keeps running."""
+    env = os.environ.copy()
+    proc = None
+    try:
+        with udp_listener() as (lsn, url):
+            env["DD_DOGSTATSD_URL"] = url
+            t0 = time.monotonic()
+            proc = subprocess.Popen(
+                [EXECUTABLE],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            lsn.settimeout(5)
+            data, _ = lsn.recvfrom(65536)
+            dt_first = time.monotonic() - t0
+            # It must still be alive: in the send loop, sleeping for the
+            # interval — not exited after one send.
+            time.sleep(2)
+            if proc.poll() is not None:
+                print(f"  FAIL: {name} - process exited after the first send")
+                return False
+            if data != EXPECTED_METRIC:
+                print(f"  FAIL: {name} - expected {EXPECTED_METRIC!r}, got {data!r}")
+                return False
+            if dt_first > 2.0:
+                print(f"  FAIL: {name} - first send took {dt_first:.2f}s; "
+                      f"expected immediate (<2s)")
+                return False
+    except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
+        print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    return True
+
+
+def run_send_period_case(name: str) -> bool:
+    """Second metric arrives ~60s after the first (TODO 6.4). Slow test."""
+    env = os.environ.copy()
+    proc = None
+    try:
+        with udp_listener() as (lsn, url):
+            env["DD_DOGSTATSD_URL"] = url
+            proc = subprocess.Popen(
+                [EXECUTABLE],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            lsn.settimeout(5)
+            data1, _ = lsn.recvfrom(65536)
+            t1 = time.monotonic()
+            lsn.settimeout(90)
+            data2, _ = lsn.recvfrom(65536)
+            dt = time.monotonic() - t1
+            if data1 != EXPECTED_METRIC or data2 != EXPECTED_METRIC:
+                print(f"  FAIL: {name} - bad payload ({data1!r}, {data2!r})")
+                return False
+            if not (50.0 <= dt <= 90.0):
+                print(f"  FAIL: {name} - second send after {dt:.1f}s; "
+                      f"expected ~60s (50-90)")
+                return False
+    except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
+        print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
     return True
 
 
@@ -370,6 +456,10 @@ def run_test(tc: TestCase) -> bool:
             raw = exc.output or b""
             text_out = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
             if tc.expect_error_contains and tc.expect_error_contains.lower() in text_out.lower():
+                return True
+            # Success cases keep running (send loop): OK output plus a timeout
+            # means it connected and entered the loop.
+            if tc.expect_success and text_out.startswith("OK:"):
                 return True
             print(f"  FAIL: {tc.name} - timeout")
             return False
@@ -456,8 +546,25 @@ def main():
             failed += 1
     
     print()
+    print("Timing tests (TODO 6.3/6.4):")
+    total = len(all_cases) + len(send_cases) + 1
+    if run_first_send_timing_case("first_send_immediate"):
+        print("  PASS: first_send_immediate")
+        passed += 1
+    else:
+        failed += 1
+    if os.environ.get("RUN_SLOW_TESTS") == "1":
+        total += 1
+        if run_send_period_case("send_period_60s"):
+            print("  PASS: send_period_60s")
+            passed += 1
+        else:
+            failed += 1
+    else:
+        print("  SKIP: send_period_60s - set RUN_SLOW_TESTS=1 to run (~75s)")
+    
+    print()
     print("=" * 60)
-    total = len(all_cases) + len(send_cases)
     print(f"Results: {passed} passed, {failed} failed out of {total} tests")
     print("=" * 60)
     
