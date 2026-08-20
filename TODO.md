@@ -355,6 +355,10 @@ Success criteria:
 ## 7. Implement Error Logging To Stdout
 
 ### 7.1 Standardize runtime log messages
+Status: done — `OK:` for the one-time startup report, `ERROR:` for every
+failure; the message text distinguishes parse errors (per-rule strings)
+from runtime errors (`socket creation failed`, `connect failed`,
+`send failed`), and the interval validation error names its variable.
 - Define message prefixes for startup, connect, send, and retry errors.
 - Include enough context to distinguish parse failures from runtime failures.
 
@@ -363,6 +367,10 @@ Success criteria:
 - Messages are stable enough for tests to match key substrings.
 
 ### 7.2 Add errno-aware logging if useful
+Status: decided — coarse messages only, no errno printing. The coarse
+strings already distinguish every failure class this client can hit, and
+raw negative returns (or an itoa helper) buy little at the minimal scope;
+strace/gdb remain the tools for errno-level diagnosis.
 - Decide whether to print raw negative syscall returns or only coarse messages.
 - If printing codes, add a tiny integer-to-string helper.
 
@@ -371,6 +379,9 @@ Success criteria:
 - The implementation cost stays proportionate to the project’s minimal scope.
 
 ### 7.3 Keep stdout logging safe inside loops
+Status: done — each entry is `ERROR:` + message + newline, so repeated
+failures stay line-oriented; `reconnect_after_epipe` drives two consecutive
+failure cycles and asserts both `ERROR:` lines appear.
 - Ensure repeated failures do not corrupt output formatting.
 - Make sure each log entry ends with a newline.
 
@@ -453,6 +464,10 @@ Success criteria:
 
 ## 9. Update Project Documentation
 
+Status: done — the README documents the supported URL forms and their v1
+limitations (9.1), the startup/send/retry/SIGPIPE runtime behavior (9.2),
+and the build/run/test commands including `RUN_SLOW_TESTS` (9.3).
+
 ### 9.1 Document supported connection strings
 - State which transports are fully supported for actual connections, not just
   for parsing.
@@ -478,6 +493,8 @@ Success criteria:
 ## 10. Final Readiness Checks
 
 ### 10.1 Run the parser suite after runtime refactors
+Status: done — the full suite (38 tests) runs green after every runtime
+change this phase; it is the standard post-refactor check.
 - Rebuild the binary.
 - Run the existing parser tests.
 
@@ -485,6 +502,8 @@ Success criteria:
 - Parser regressions are caught before runtime testing begins.
 
 ### 10.2 Run end-to-end transport checks
+Status: done — the `send_*` cases capture the actual metric bytes over UDP
+and both Unix transports from live listeners.
 - Verify at least one Unix socket path and one UDP path end to end.
 - Capture the actual metric bytes received by the test listener.
 
@@ -492,6 +511,10 @@ Success criteria:
 - Supported transports work in a live send scenario.
 
 ### 10.3 Review failure behavior under repetition
+Status: done — repeated connect failures: `unix_datagram_no_peer` (process
+stays alive and keeps logging); repeated send failures:
+`reconnect_after_epipe` (two consecutive EPIPE cycles, each bounded by the
+sleep interval and observable on stdout).
 - Force repeated connect failures.
 - Force repeated send failures.
 - Confirm the process keeps logging and retrying instead of spinning or dying
@@ -501,6 +524,8 @@ Success criteria:
 - Failure loops are bounded by sleep and remain observable on stdout.
 
 ### 10.4 Decide what is explicitly out of scope for v1
+Status: done — recorded under "v1 scope" in README.md (no DNS, fixed
+metric payload, no TCP/TLS, env read once at startup).
 - If DNS, full IPv6 connect support, or rich metric configurability are not in
   the first milestone, write that down.
 

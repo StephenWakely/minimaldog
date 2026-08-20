@@ -429,8 +429,9 @@ def run_send_period_short_case(name: str, interval: int = 2) -> bool:
 
 
 def run_reconnect_epipe_case(name: str, interval: int = 2) -> bool:
-    """Stream peer closes after the first metric (TODO 8.4): the client must
-    log the send failure, survive SIGPIPE, and reconnect on a later cycle."""
+    """Stream peer closes after each metric (TODO 8.4/10.3): the client must
+    log the send failure, survive SIGPIPE, and reconnect on a later cycle —
+    twice, to prove repeated failures stay bounded and readable."""
     env = os.environ.copy()
     proc = None
     try:
@@ -443,22 +444,22 @@ def run_reconnect_epipe_case(name: str, interval: int = 2) -> bool:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
-            lsn.settimeout(10)
-            conn, _ = lsn.accept()
-            data1 = conn.recv(len(EXPECTED_METRIC))
-            t_close = time.monotonic()
-            conn.close()  # peer goes away -> EPIPE on the client's next write
-            lsn.settimeout(interval * 3 + 10)
-            conn2, _ = lsn.accept()  # reconnection on a later cycle
-            data2 = conn2.recv(len(EXPECTED_METRIC))
+            t_close = None
+            for cycle in range(3):  # initial connect + two reconnects
+                lsn.settimeout(interval * 3 + 10)
+                conn, _ = lsn.accept()
+                data = conn.recv(len(EXPECTED_METRIC))
+                if data != EXPECTED_METRIC:
+                    print(f"  FAIL: {name} - bad payload on cycle {cycle}: {data!r}")
+                    return False
+                if cycle < 2:
+                    conn.close()  # peer goes away -> EPIPE on the next write
+                    if t_close is None:
+                        t_close = time.monotonic()
             dt = time.monotonic() - t_close
-            conn2.close()
-            if data1 != EXPECTED_METRIC or data2 != EXPECTED_METRIC:
-                print(f"  FAIL: {name} - bad payload ({data1!r}, {data2!r})")
-                return False
-            if not (interval * 0.5 <= dt <= interval * 3 + 10):
-                print(f"  FAIL: {name} - reconnected after {dt:.1f}s; "
-                      f"expected within ~{interval * 3 + 10}s")
+            if not (interval * 0.5 <= dt <= interval * 6 + 15):
+                print(f"  FAIL: {name} - two reconnect cycles took {dt:.1f}s; "
+                      f"expected within ~{interval * 6 + 15}s")
                 return False
     except (subprocess.TimeoutExpired, socket.timeout, OSError) as exc:
         print(f"  FAIL: {name} - {type(exc).__name__}: {exc}")
@@ -474,8 +475,10 @@ def run_reconnect_epipe_case(name: str, interval: int = 2) -> bool:
             if not lines or not lines[0].startswith("OK:"):
                 print(f"  FAIL: {name} - missing OK startup report: {text!r}")
                 return False
-            if not any("ERROR" in l and "send failed" in l for l in lines):
-                print(f"  FAIL: {name} - missing 'ERROR:send failed' after EPIPE: {text!r}")
+            err_lines = [l for l in lines if "ERROR" in l and "send failed" in l]
+            if len(err_lines) < 2:
+                print(f"  FAIL: {name} - expected two 'ERROR:send failed' lines, "
+                      f"got {len(err_lines)}: {text!r}")
                 return False
     return True
 

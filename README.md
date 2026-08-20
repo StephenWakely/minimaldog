@@ -102,7 +102,18 @@ No tags in v1; the name/type are fixed.
   repeat create + connect, datagram transports keep the socket; sleep for
   the retry interval, resume sending.
 - The retry interval **is** the metric interval: one constant, default
-  60 seconds.
+  60 seconds (overridable via `DD_DOGSTATSD_INTERVAL_SECS`, see above).
+
+### v1 scope (TODO 10.4)
+
+Explicitly out of scope for v1:
+
+- DNS / hostname resolution — UDP hosts must be numeric IPv4 or bracketed
+  IPv6; hostnames are a deterministic startup error
+- Metric configurability — the payload, metric name, type, and tags are
+  fixed (`minimaldog.heartbeat:1|c`)
+- Transports other than UDP and Unix datagram/stream (no TCP/TLS)
+- Runtime reconfiguration — the environment is read once at startup
 
 ## Build
 
@@ -131,12 +142,16 @@ DD_DOGSTATSD_URL=udp://127.0.0.1:8125 nix run .
 
 ## Tests
 
-`test_dogstatsd.py` is a table-driven pytest suite that executes the
-compiled binary with a matrix of valid and invalid `DD_DOGSTATSD_URL` values
-and checks the stdout/exit-code contract. Build first, then:
+`test_dogstatsd.py` is a table-driven black-box suite that executes the
+compiled binary against a matrix of valid and invalid `DD_DOGSTATSD_URL`
+values plus live local listeners (UDP and Unix sockets), checking the
+stdout/exit-code contract, metric payloads, send timing, and EPIPE
+reconnection. Build first, then:
 
 ```sh
-nix develop . --command pytest test_dogstatsd.py
+nix develop . --command python3 test_dogstatsd.py
+# adds the real 60s period test (~75s more):
+RUN_SLOW_TESTS=1 nix develop . --command python3 test_dogstatsd.py
 ```
 
 ## Project layout
@@ -165,6 +180,8 @@ nix develop . --command pytest test_dogstatsd.py
 
 ## Status
 
-URL parsing, validation, and socket creation are implemented and tested.
-Sending actual DogStatsD metrics (steady-state send loop) is the next phase
-— see `TODO.md`.
+Complete through TODO 10: URL parsing, validation, socket lifecycle, metric
+emission, the steady-state send/retry loop with SIGPIPE handling, interval
+override for fast tests, and the verification suite (38 tests, plus a slow
+60s period test). All backlog items in `TODO.md` are marked done or
+decided.
