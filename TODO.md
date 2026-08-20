@@ -185,7 +185,18 @@ Success criteria:
 
 ## 4. Implement Socket Lifecycle
 
+Status: done — `create_socket`, `build_addr`, `connect_socket`, and
+`close_socket` are separate helpers; the startup retry loop (log, sleep for
+the interval, close, recreate, reconnect) is implemented and verified for all
+three transports (UDP v4/v6, Unix datagram, Unix stream). Two bugs found and
+fixed during verification: `SOCK_STREAM`/`SOCK_DGRAM` were swapped in the asm
+constants, and `cs_udp` always created AF_INET sockets (now selects
+AF_INET6 when the host is bracketed).
+
 ### 4.1 Split socket creation from address parsing
+Status: done — `create_socket` opens the fd per parsed transport and stores
+it in `[socket_fd]` (returns 1/0); `build_addr` dispatches to the three
+address builders with separate error codes.
 - Refactor `create_socket` so it only opens the fd and returns it.
 - Add a separate helper that builds the destination address and length.
 
@@ -195,6 +206,10 @@ Success criteria:
 - Each helper has a single responsibility.
 
 ### 4.2 Implement `connect_socket`
+Status: done — `connect_socket([socket_fd])` connects to the address built by
+`build_addr`; failures log `ERROR:connect failed` and return to the startup
+retry loop (verified: connect fails + retries when no Unix peer/listener
+exists; UDP connect pins the default destination).
 - Add a helper that calls `connect` for Unix datagram, Unix stream, and UDP.
 - For connected UDP sockets, call `connect` once so later sends can use `write`
   or `send`.
@@ -205,6 +220,12 @@ Success criteria:
 - Failures from `connect` are logged and return control to the retry policy.
 
 ### 4.3 Decide whether to reconnect on every failure
+Status: decided — `[socket_fd] == 0` is the "no usable socket" state; there
+is no separate flag. Before the first send, every create/connect failure goes
+through the startup retry loop, which closes any live fd before reopening.
+After a successful send (TODO 5/6): stream transports close and reconnect on
+any send failure; datagram transports keep the socket and simply retry the
+send. Documented in the "Socket lifecycle rules" comment above `_start`.
 - For stream sockets, any send failure may require closing and reconnecting.
 - For datagram sockets, decide whether send failure should also trigger
   close-and-reconnect.
@@ -215,6 +236,9 @@ Success criteria:
   discarded.
 
 ### 4.4 Implement `close_socket`
+Status: done — `close_socket` closes `[socket_fd]` and clears it; safe to
+call when no socket is open. The startup retry loop calls it before every
+recreate, and all configuration-error exit paths close the fd first.
 - Add a helper for `close(fd)` and clear the stored fd afterward.
 - Make it safe to call when no socket is open.
 
@@ -325,7 +349,16 @@ Success criteria:
 
 ## 8. Add Verification Coverage
 
+Status: in progress — 8.1 and the Unix half of 8.2 landed with milestone 4
+(`test_dogstatsd.py` is green, 25/25): the hostname case now expects the v1
+"unsupported host" startup error, and the four Unix success cases bind a live
+peer socket (datagram or stream) at the target path before running. UDP
+connect cases (`udp_127_0_0_1_8125`, `udp_ipv6_loopback`) already exercise
+real `connect()` since UDP connect succeeds without a listener.
+
 ### 8.1 Extend parser tests only where behavior changed
+Status: done — `udp_localhost_8125` now expects the deterministic v1 startup
+error ("unsupported host"); all other parser expectations unchanged and green.
 - Keep existing URL parser tests passing.
 - Update any expectations if transport support is intentionally narrowed for the
   first connection milestone.
@@ -334,6 +367,10 @@ Success criteria:
 - Current parser coverage still passes after the runtime changes.
 
 ### 8.2 Add connection-setup tests
+Status: partial — Unix datagram/stream success cases use a live peer fixture
+(`unix_peer` context manager in `test_dogstatsd.py`), and
+`unix_datagram_no_peer` asserts the log-and-retry behavior on connect failure.
+UDP connect coverage exists implicitly (UDP connect needs no listener).
 - Add tests for successful Unix socket connection setup.
 - Add tests for UDP numeric IP address connection setup.
 - Add tests for unsupported hostname or IPv6 behavior if those are deferred.

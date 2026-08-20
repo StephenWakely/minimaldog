@@ -29,6 +29,10 @@ section .data
     err_unix_query: db "query not allowed in unix URL", 0
     err_unix_fragment: db "fragment not allowed in unix URL", 0
     err_socket_create: db "socket creation failed", 0
+    err_connect: db "connect failed", 0
+    err_bad_host: db "unsupported host (numeric IPv4 required in v1)", 0
+    err_bad_v6: db "malformed IPv6 address", 0
+    err_path_too_long: db "unix path too long", 0
     
     scheme_udp: db "udp://", 0
     scheme_unix: db "unix://", 0
@@ -37,8 +41,8 @@ section .data
     AF_INET equ 2
     AF_INET6 equ 10
     AF_UNIX equ 1
-    SOCK_DGRAM equ 1
-    SOCK_STREAM equ 2
+    SOCK_STREAM equ 1        ; per <asm-generic/socket.h>
+    SOCK_DGRAM equ 2
     IPPROTO_UDP equ 17
 
 ; --- sockaddr layout constants (TODO 3.1) -----------------------------------
@@ -55,12 +59,19 @@ section .data
     SIN6_OFF_PORT equ 2         ; sin6_port (network byte order)
     SIN6_FLOWINFO equ 4         ; sin6_flowinfo
     SIN6_OFF_ADDR equ 12        ; sin6_addr (16 bytes)
+
+; Address construction failure codes (returned in rax by build_addr):
+ADDR_ERR_HOST equ 1       ; build_ipv4_addr: hostname / non-numeric text
+ADDR_ERR_V6 equ 2         ; build_ipv6_addr: malformed IPv6 text
+ADDR_ERR_PATHLEN equ 3    ; build_unix_addr: path does not fit sun_path
     
     SYS_write equ 1
     SYS_exit equ 60
     SYS_getenv equ 318
+    SYS_close equ 3
     SYS_socket equ 41
     SYS_connect equ 42
+    SYS_nanosleep equ 35
 
 section .bss
     url_buf: resb 1024
@@ -82,6 +93,7 @@ section .bss
                               ; sockaddr_in / sockaddr_in6 (16 / 28)
     socklen: resw 2           ; length of the address in sockaddr_buf
     interval_secs: resd 4     ; metric and retry interval, default 60 (TODO 1.3)
+    sleep_ts: resq 2          ; struct timespec {tv_sec, tv_nsec} for sleep_interval
     parse_only: resb 1        ; DD_DOGSTATSD_PARSE_ONLY set -> print OK, exit 0
 ; --- Canonical parse results handed to address construction (TODO 2.2/2.3) --
 ; The host stays textual until connect time; the ipv6 flag and the binary
@@ -133,6 +145,14 @@ section .text
 ;   exits on these either.
 ;   Retry interval = metric interval (one constant, default 60s).
 ;
+; Socket lifecycle rules (decided in TODO 4.3):
+;   [socket_fd] == 0 is the "no usable socket" state; there is no separate
+;   flag. Before the first send, every create/connect failure goes through
+;   the startup retry loop, which closes any live fd before reopening.
+;   After a successful send: stream transports close and reconnect on any
+;   send failure; datagram transports keep the socket and simply retry the
+;   send (implemented in TODO 5/6 when sending exists).
+;
 ; Net: in steady state the only exit is exit(1) on configuration errors.
 ; (Until the send loop lands, a valid URL still prints OK and exits 0.)
 ; ---------------------------------------------------------------------------
@@ -158,11 +178,55 @@ _start:
     call parse_url
     test rax, rax
     jnz start_parse_error
+    ; TODO 1.3: one constant for the metric and the retry interval.
+    mov dword [interval_secs], 60
+startup_retry:               ; pre-first-send failures retry forever (TODO 4.2)
+    call close_socket         ; discard a failed socket from a previous pass;
+                              ; no-op on the first iteration ([socket_fd] == 0)
     call create_socket
     test rax, rax
-    jz start_socket_error
+    jz startup_sock_fail
+    call build_addr
+    test rax, rax
+    jz startup_addr_ok
+    ; Address construction failure is a configuration error: the input cannot
+    ; change while the process runs, so log and exit(1) (TODO 1.3).
+    cmp al, ADDR_ERR_HOST
+    je startup_bad_host
+    cmp al, ADDR_ERR_V6
+    je startup_bad_v6
+    call close_socket
+    mov rdi, err_path_too_long
+    call output_error
+    jmp start_exit_error
+startup_bad_host:
+    call close_socket
+    mov rdi, err_bad_host
+    call output_error
+    jmp start_exit_error
+startup_bad_v6:
+    call close_socket
+    mov rdi, err_bad_v6
+    call output_error
+    jmp start_exit_error
+startup_addr_ok:
+    call connect_socket
+    test rax, rax
+    jz startup_conn_fail
+    ; The socket is up. Until the send loop lands (TODO 5/6), report success
+    ; and exit(0).
     call output_success
     jmp start_exit_success
+startup_sock_fail:
+    mov rdi, err_socket_create
+    call output_error
+    jmp startup_sleep
+startup_conn_fail:
+    mov rdi, err_connect
+    call output_error
+startup_sleep:
+    call sleep_interval
+    jmp startup_retry
 
 start_not_found:
     mov rdi, err_not_found
@@ -177,11 +241,6 @@ start_empty_url:
 start_parse_error:
     dec rax
     mov rdi, [parse_error_msgs + rax*8]
-    call output_error
-    jmp start_exit_error
-
-start_socket_error:
-    mov rdi, err_socket_create
     call output_error
     jmp start_exit_error
 
@@ -603,10 +662,11 @@ strncmp_done:
 ; --- Address construction (TODO 3.2-3.5) ------------------------------------
 ; All builders write into sockaddr_buf and set [socklen]. They return 0 on
 ; success and a nonzero error code on failure:
-;   build_unix_addr: 1 = path too long for sun_path
-;   build_ipv4_addr: 1 = not a valid dotted-quad numeric address (this is how
-;                    unsupported hostnames are detected, TODO 3.5)
-;   build_ipv6_addr: 1 = malformed IPv6 text
+;   build_unix_addr: ADDR_ERR_PATHLEN (3) = path too long for sun_path
+;   build_ipv4_addr: ADDR_ERR_HOST (1) = not a valid dotted-quad numeric
+;                    address (this is how unsupported hostnames are detected,
+;                    TODO 3.5)
+;   build_ipv6_addr: ADDR_ERR_V6 (2) = malformed IPv6 text
 ;
 ; v1 scope (TODO 3.5): no DNS resolution. Only numeric IP literals connect;
 ; udp://localhost:8125 is a deterministic startup error.
@@ -634,7 +694,7 @@ bua_done:
     xor rax, rax
     ret
 bua_toolong:
-    mov rax, 1
+    mov rax, ADDR_ERR_PATHLEN
     ret
 
 ; build_ipv4_addr: sockaddr_in from parsed_host (dotted quad) and the cached
@@ -686,7 +746,7 @@ biva_after_octet:
     xor rax, rax
     ret
 biva_invalid:
-    mov rax, 1
+    mov rax, ADDR_ERR_HOST
     ret
 
 ; build_ipv6_addr: sockaddr_in6 from bracketed IPv6 text in parsed_host.
@@ -869,7 +929,7 @@ b6_ok:
     xor rax, rax
     ret
 b6_invalid:
-    mov rax, 1
+    mov rax, ADDR_ERR_V6
     ret
 
 ; build_addr: dispatch on transport/ipv6 flag. Returns the builder's code.
@@ -887,48 +947,93 @@ ba_unix:
     call build_unix_addr
     ret
 
+; create_socket (TODO 4.1): open a socket per the parsed transport and store
+; the fd in [socket_fd]. Returns 1 on success, 0 on failure ([socket_fd]
+; left 0). Address construction is a separate unit: build_addr.
 create_socket:
     mov al, [parsed_transport]
     cmp al, 1
-    je create_socket_udp
+    je cs_udp
     cmp al, 2
-    je create_socket_uds_dg
+    je cs_uds_dg
     cmp al, 3
-    je create_socket_uds_str
+    je cs_uds_str
     xor rax, rax
     ret
-create_socket_udp:
+cs_udp:
+    mov esi, SOCK_DGRAM
+    test byte [parsed_ipv6], 1
+    jz cs_udp4                ; bracketed host -> AF_INET6 socket
+    mov edi, AF_INET6
+    jmp cs_syscall
+cs_udp4:
+    mov edi, AF_INET
+    jmp cs_syscall
+cs_uds_dg:
+    mov edi, AF_UNIX
+    mov esi, SOCK_DGRAM
+    jmp cs_syscall
+cs_uds_str:
+    mov edi, AF_UNIX
+    mov esi, SOCK_STREAM
+cs_syscall:
+    xor edx, edx
     mov rax, SYS_socket
-    mov rdi, AF_INET
-    mov rsi, SOCK_DGRAM
-    xor rdx, rdx
     syscall
     test rax, rax
-    jl create_socket_fail
+    js cs_fail
+    mov [socket_fd], eax
     mov rax, 1
     ret
-create_socket_uds_dg:
-    mov rax, SYS_socket
-    mov rdi, AF_UNIX
-    mov rsi, SOCK_DGRAM
-    xor rdx, rdx
-    syscall
-    test rax, rax
-    jl create_socket_fail
-    mov rax, 1
-    ret
-create_socket_uds_str:
-    mov rax, SYS_socket
-    mov rdi, AF_UNIX
-    mov rsi, SOCK_STREAM
-    xor rdx, rdx
-    syscall
-    test rax, rax
-    jl create_socket_fail
-    mov rax, 1
-    ret
-create_socket_fail:
+cs_fail:
     xor rax, rax
+    ret
+
+; connect_socket (TODO 4.2): connect([socket_fd]) to the address built by
+; build_addr. For UDP this pins the default destination so later sends can
+; use write/send and receive ICMP errors; for UDS_STREAM it establishes the
+; connection; for UDS_DATAGRAM it pins the peer. Returns 1 on success,
+; 0 on failure.
+connect_socket:
+    mov eax, [socket_fd]
+    test eax, eax
+    jz conn_fail
+    mov edi, eax
+    lea rsi, [sockaddr_buf]
+    movzx edx, word [socklen]
+    mov rax, SYS_connect
+    syscall
+    test rax, rax
+    js conn_fail
+    xor rax, rax
+    inc rax
+    ret
+conn_fail:
+    xor rax, rax
+    ret
+
+; close_socket (TODO 4.4): close([socket_fd]) and clear it. Safe to call
+; when no socket is open ([socket_fd] == 0).
+close_socket:
+    mov eax, [socket_fd]
+    test eax, eax
+    jz close_done
+    mov edi, eax
+    mov rax, SYS_close
+    syscall
+close_done:
+    mov dword [socket_fd], 0
+    ret
+
+; sleep_interval (TODO 6.1/6.2, pulled forward for the retry loop):
+; nanosleep for [interval_secs] seconds.
+sleep_interval:
+    mov rax, [interval_secs]
+    mov [sleep_ts], rax
+    xor qword [sleep_ts+8], 0
+    lea rdi, [sleep_ts]
+    mov eax, SYS_nanosleep
+    syscall
     ret
 output_success:
     mov rsi, ok_prefix

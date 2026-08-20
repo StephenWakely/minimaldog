@@ -4,9 +4,11 @@ Table-driven tests for the DogStatsD URL parser (assembly implementation).
 Tests the executable by running it with various DD_DOGSTATSD_URL values.
 """
 
+import socket
 import subprocess
 import os
 import sys
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,17 +25,20 @@ class TestCase:
     expect_port: Optional[str] = None
     expect_path: Optional[str] = None
     expect_error_contains: Optional[str] = None
+    # When set ("dgram" or "stream"), a live Unix socket peer is bound at
+    # expect_path for the duration of the case (connection-setup tests).
+    peer_kind: Optional[str] = None
     skip_reason: Optional[str] = None
 
 # Valid test cases
 VALID_CASES = [
+    # v1 scope (TODO 3.5): no DNS resolution. Hostnames parse fine but are a
+    # deterministic startup error at address construction.
     TestCase(
         name="udp_localhost_8125",
         url="udp://localhost:8125",
-        expect_success=True,
-        expect_transport="UDP",
-        expect_host="localhost",
-        expect_port="8125",
+        expect_success=False,
+        expect_error_contains="host",
     ),
     TestCase(
         name="udp_127_0_0_1_8125",
@@ -53,31 +58,35 @@ VALID_CASES = [
     ),
     TestCase(
         name="unix_datagram_socket",
-        url="unix:///var/run/datadog/dsd.socket",
+        url="unix:///tmp/minimaldog-test/dsd.socket",
         expect_success=True,
         expect_transport="UDS_DATAGRAM",
-        expect_path="/var/run/datadog/dsd.socket",
+        expect_path="/tmp/minimaldog-test/dsd.socket",
+        peer_kind="dgram",
     ),
     TestCase(
         name="unix_stream_socket",
-        url="unixstream:///var/run/datadog/dsd-stream.socket",
+        url="unixstream:///tmp/minimaldog-test/dsd-stream.socket",
         expect_success=True,
         expect_transport="UDS_STREAM",
-        expect_path="/var/run/datadog/dsd-stream.socket",
+        expect_path="/tmp/minimaldog-test/dsd-stream.socket",
+        peer_kind="stream",
     ),
     TestCase(
         name="unix_path_with_percent_encoding",
-        url="unix:///var/run/my%20socket.sock",
+        url="unix:///tmp/minimaldog-test/my%20socket.sock",
         expect_success=True,
         expect_transport="UDS_DATAGRAM",
-        expect_path="/var/run/my socket.sock",
+        expect_path="/tmp/minimaldog-test/my socket.sock",
+        peer_kind="dgram",
     ),
     TestCase(
         name="unix_path_encoded_slash",
-        url="unix:///tmp/test%2Fpath.sock",
+        url="unix:///tmp/minimaldog-test/test%2Fpath.sock",
         expect_success=True,
         expect_transport="UDS_DATAGRAM",
-        expect_path="/tmp/test/path.sock",
+        expect_path="/tmp/minimaldog-test/test/path.sock",
+        peer_kind="dgram",
     ),
 ]
 
@@ -118,6 +127,14 @@ INVALID_CASES = [
         url="unixstream://",
         expect_success=False,
         expect_error_contains="path",
+    ),
+    # No peer socket exists at this path: connect fails, the binary logs and
+    # retries forever (retry loop), so the case times out after logging.
+    TestCase(
+        name="unix_datagram_no_peer",
+        url="unix:///tmp/minimaldog-test/nopeer.sock",
+        expect_success=False,
+        expect_error_contains="connect",
     ),
     TestCase(
         name="unknown_scheme_tcp",
@@ -234,6 +251,25 @@ def parse_output(output: str) -> dict:
     return result
 
 
+@contextmanager
+def unix_peer(path: str, kind: str):
+    """Bind a live Unix socket peer at path for the duration of the block."""
+    sock_type = socket.SOCK_STREAM if kind == "stream" else socket.SOCK_DGRAM
+    fd = socket.socket(socket.AF_UNIX, sock_type)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        fd.bind(path)
+        if kind == "stream":
+            fd.listen(4)
+        yield
+    finally:
+        fd.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def run_test(tc: TestCase) -> bool:
     """Run a single test case and return True if it passes."""
     if tc.skip_reason:
@@ -248,21 +284,29 @@ def run_test(tc: TestCase) -> bool:
     else:
         env["DD_DOGSTATSD_URL"] = tc.url
     
-    try:
-        result = subprocess.run(
-            [EXECUTABLE],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        output = result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
-        print(f"  FAIL: {tc.name} - timeout")
-        return False
-    except FileNotFoundError:
-        print(f"  FAIL: {tc.name} - executable not found at {EXECUTABLE}")
-        return False
+    peer = unix_peer(tc.expect_path, tc.peer_kind) if tc.peer_kind else nullcontext()
+    with peer:
+        try:
+            result = subprocess.run(
+                [EXECUTABLE],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            output = result.stdout + result.stderr
+        except subprocess.TimeoutExpired as exc:
+            # The retry loop keeps the process alive after logging a connect
+            # failure; if an error substring was expected, check what it wrote.
+            raw = exc.output or b""
+            text_out = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+            if tc.expect_error_contains and tc.expect_error_contains.lower() in text_out.lower():
+                return True
+            print(f"  FAIL: {tc.name} - timeout")
+            return False
+        except FileNotFoundError:
+            print(f"  FAIL: {tc.name} - executable not found at {EXECUTABLE}")
+            return False
     
     parsed = parse_output(output)
     

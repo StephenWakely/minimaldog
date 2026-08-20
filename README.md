@@ -17,8 +17,8 @@ manually from the `_start` stack layout — there is no `getenv`).
 
 | URL | Result |
 | --- | --- |
-| `udp://host:port` | `OK:UDP:host:port` — `AF_INET` / `SOCK_DGRAM` socket |
-| `udp://[ipv6]:port` | `OK:UDP:ipv6:port` — bracketed IPv6 hosts |
+| `udp://ip:port` | `OK:UDP:ip:port` — `AF_INET` / `SOCK_DGRAM` socket (v1: numeric IPv4 only, no DNS) |
+| `udp://[ipv6]:port` | `OK:UDP:ipv6:port` — bracketed IPv6 hosts, `AF_INET6` socket |
 | `unix:///abs/path` | `OK:UDS_DATAGRAM:/abs/path` — `AF_UNIX` / `SOCK_DGRAM` |
 | `unixstream:///abs/path` | `OK:UDS_STREAM:/abs/path` — `AF_UNIX` / `SOCK_STREAM` |
 
@@ -33,8 +33,11 @@ Validation rules:
 ### Output and exit codes
 
 ```console
+$ DD_DOGSTATSD_URL=udp://127.0.0.1:8125 ./dogstatsd
+OK:UDP:127.0.0.1:8125            # exit 0
+
 $ DD_DOGSTATSD_URL=udp://localhost:8125 ./dogstatsd
-OK:UDP:localhost:8125            # exit 0
+ERROR:unsupported host (numeric IPv4 required in v1)   # exit 1
 
 $ DD_DOGSTATSD_URL=gopher://x:1 ./dogstatsd
 ERROR:unknown scheme             # exit 1
