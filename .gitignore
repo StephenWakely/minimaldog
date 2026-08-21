@@ -2,5 +2,7 @@ __pycache__/
 *.pyc
 dogstatsd
 dogstatsd.o
+result
 result/
+result/bin
 trace.*

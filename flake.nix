@@ -1,5 +1,5 @@
 {
-  description = "Minimal DogStatsD client in x86-64 assembly";
+  description = "Minimal DogStatsD heartbeat client in x86-64 assembly";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -13,16 +13,16 @@
       in
       {
         packages.default = pkgs.stdenv.mkDerivation {
-          name = "dogstatsd-client";
+          name = "minimal-dogstatsd-heartbeat";
           src = ./.;
           nativeBuildInputs = [ pkgs.nasm pkgs.binutils ];
           buildPhase = ''
-            nasm -f elf64 -o dogstatsd.o dogstatsd.asm
-            ld -o dogstatsd dogstatsd.o
+            nasm -f elf64 -o minimaldog.o minimaldog.asm
+            ld -o minimaldog minimaldog.o
           '';
           installPhase = ''
             mkdir -p $out/bin
-            cp dogstatsd $out/bin/
+            cp minimaldog $out/bin/
           '';
         };
 
@@ -38,7 +38,7 @@
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/dogstatsd";
+          program = "${self.packages.${system}.default}/bin/minimaldog";
         };
       }
     );
