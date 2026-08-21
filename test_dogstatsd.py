@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 # Path to the compiled executable
-EXECUTABLE = os.path.join(os.path.dirname(__file__), "dogstatsd")
+EXECUTABLE = os.path.join(os.path.dirname(__file__), "minimaldog")
 
 @dataclass
 class TestCase:

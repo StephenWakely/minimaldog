@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
-dogstatsd
-dogstatsd.o
+minimaldog
+minimaldog.o
 result
 result/
 result/bin

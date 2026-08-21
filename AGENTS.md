@@ -1,6 +1,6 @@
 # minimaldog
 
-A minimal DogStatsD client in bare x86-64 assembly (`dogstatsd.asm`). No libc —
+A minimal DogStatsD client in bare x86-64 assembly (`minimaldog.asm`). No libc —
 hand-rolled `write`/`exit` syscalls, manual stack-walking of `envp` at `_start`.
 
 ## Toolchain (via the nix flake)
@@ -20,7 +20,7 @@ Install additional debugging tools by adding them to `devShell.packages` in
 ## Build
 
 ```sh
-nix develop . --command sh -c 'nasm -f elf64 -o dogstatsd.o dogstatsd.asm && ld -o dogstatsd dogstatsd.o'
+nix develop . --command sh -c 'nasm -f elf64 -o minimaldog.o minimaldog.asm && ld -o minimaldog minimaldog.o'
 ```
 
 ## Verifying asm behavior
