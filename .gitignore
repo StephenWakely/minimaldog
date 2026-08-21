@@ -3,3 +3,4 @@ __pycache__/
 dogstatsd
 dogstatsd.o
 result/
+trace.*

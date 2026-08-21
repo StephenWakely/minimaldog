@@ -1,4 +1,0 @@
-Breakpoint 1 at 0x40100e
-Breakpoint 2 at 0x4010a5
-0x0000000000401011 in find_env_var ()
-FINAL pc=0x401011
