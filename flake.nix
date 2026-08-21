@@ -10,9 +10,9 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-      in
-      {
-        packages.default = pkgs.stdenv.mkDerivation {
+
+        # The client itself: a static x86-64 Linux binary with no libc.
+        client = pkgs.stdenv.mkDerivation {
           name = "minimal-dogstatsd-heartbeat";
           src = ./.;
           nativeBuildInputs = [ pkgs.nasm pkgs.binutils ];
@@ -26,6 +26,28 @@
           '';
         };
 
+        # Docker image. dockerTools' streamLayeredImage is a script that
+        # writes a docker-save-compatible tarball to stdout:
+        #   nix build .#packages.x86_64-linux.dockerImage
+        #   docker load -i <(./result -t minimaldog:latest)
+        #
+        # The binary is static, so the image contains nothing but
+        # /bin/minimaldog — no base OS. A default DD_DOGSTATSD_URL is baked
+        # in so `docker run minimaldog` works out of the box; override it
+        # with -e at run time.
+        dockerImage = pkgs.dockerTools.streamLayeredImage {
+          name = "minimaldog";
+          contents = [ client ];
+          config = {
+            Entrypoint = [ "/bin/minimaldog" ];
+            Env = [ "DD_DOGSTATSD_URL=udp://127.0.0.1:8125" ];
+          };
+        };
+      in
+      {
+        packages.default = client;
+        packages.dockerImage = dockerImage;
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.nasm
@@ -38,7 +60,7 @@
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/minimaldog";
+          program = "${client}/bin/minimaldog";
         };
       }
     );

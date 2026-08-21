@@ -38,13 +38,13 @@ Validation rules:
 ### Output and exit codes
 
 ```console
-$ DD_DOGSTATSD_URL=udp://127.0.0.1:8125 ./dogstatsd
+$ DD_DOGSTATSD_URL=udp://127.0.0.1:8125 ./minimaldog
 OK:UDP:127.0.0.1:8125            # then keeps running (send loop)
 
-$ DD_DOGSTATSD_URL=udp://localhost:8125 ./dogstatsd
+$ DD_DOGSTATSD_URL=udp://localhost:8125 ./minimaldog
 ERROR:unsupported host (numeric IPv4 required in v1)   # exit 1
 
-$ DD_DOGSTATSD_URL=gopher://x:1 ./dogstatsd
+$ DD_DOGSTATSD_URL=gopher://x:1 ./minimaldog
 ERROR:unknown scheme             # exit 1
 ```
 
@@ -57,12 +57,12 @@ empty`, `unknown scheme`, `UDP requires port`, `UDP port out of range`,
 `Unix socket path must be absolute`, `malformed percent escape`,
 `socket creation failed`, `connect failed`, `send failed`,
 `DD_DOGSTATSD_INTERVAL_SECS must be 1-3600`, and friends (see the `err_*`
-strings in `dogstatsd.asm`).
+strings in `minimaldog.asm`).
 
 ### Locked-in runtime flow and failure policy (TODO 1.1)
 
 The steady-state control flow is decided and written as a comment above
-`_start` in `dogstatsd.asm`; TODO items 2–8 will implement it:
+`_start` in `minimaldog.asm`:
 
 - After a successful parse: `create_socket` → `connect_socket` →
   `send_loop` (send metric → sleep for the interval → repeat).
@@ -121,18 +121,33 @@ The toolchain comes from the Nix flake (`nasm` + binutils `ld`); neither is
 expected to be on the system `PATH`:
 
 ```sh
-nix develop . --command sh -c 'nasm -f elf64 -o dogstatsd dogstatsd.asm && ld -o dogstatsd dogstatsd.o'
+nix develop . --command sh -c 'nasm -f elf64 -o minimaldog.o minimaldog.asm && ld -o minimaldog minimaldog.o'
 ```
 
 Or via the flake package:
 
 ```sh
 nix build .
-./result/bin/dogstatsd
+./result/bin/minimaldog
 ```
 
 `nix develop .` gives a shell with `nasm`, `ld`, `python3`, `pytest`, and
 `gdb`.
+
+### Docker image
+
+The binary is static, so the flake builds a base-OS-free image containing
+only `/bin/minimaldog` (via `dockerTools`). A default
+`DD_DOGSTATSD_URL=udp://127.0.0.1:8125` is baked in; override it at run
+time:
+
+```sh
+nix build .#packages.x86_64-linux.dockerImage
+docker load -i <(./result -t minimaldog:latest)
+docker run --rm -e DD_DOGSTATSD_URL=udp://host:port minimaldog
+```
+
+(`Dockerfile` is an equivalent manual fallback.)
 
 ## Run
 
@@ -158,12 +173,11 @@ RUN_SLOW_TESTS=1 nix develop . --command python3 test_dogstatsd.py
 
 | File | Purpose |
 | --- | --- |
-| `dogstatsd.asm` | The entire client: envp scan, URL parser, socket creation, output |
-| `flake.nix` | Build package, dev shell (nasm, binutils, python3, pytest, gdb) |
+| `minimaldog.asm` | The entire client: envp scan, URL parser, socket creation, output |
+| `flake.nix` | Build package, docker image, dev shell (nasm, binutils, python3, pytest, gdb) |
+| `Dockerfile` | Manual docker build fallback (the flake's docker image is preferred) |
 | `test_dogstatsd.py` | Table-driven black-box tests of the binary |
 | `probe.c` | Small C probe that mirrors the asm's envp/stack logic for debugging |
-| `trace.gdb` | GDB convenience script for stepping through `_start` |
-| `TODO.md` | Backlog for the next phase (metric send loop) |
 
 ## Design notes
 
@@ -180,8 +194,7 @@ RUN_SLOW_TESTS=1 nix develop . --command python3 test_dogstatsd.py
 
 ## Status
 
-Complete through TODO 10: URL parsing, validation, socket lifecycle, metric
-emission, the steady-state send/retry loop with SIGPIPE handling, interval
-override for fast tests, and the verification suite (38 tests, plus a slow
-60s period test). All backlog items in `TODO.md` are marked done or
-decided.
+Complete: URL parsing, validation, socket lifecycle, metric emission, the
+steady-state send/retry loop with SIGPIPE handling, interval override for
+fast tests, docker image packaging, and the verification suite (38 tests,
+plus a slow 60s period test).
